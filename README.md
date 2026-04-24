@@ -1,4 +1,4 @@
-# ICONIA Firmware + Cloud Ingest
+# ICONIA Firmware + Cloud Server
 
 ICONIA 프로젝트용 펌웨어와 서버 코드입니다.
 
