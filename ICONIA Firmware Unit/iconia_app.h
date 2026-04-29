@@ -122,6 +122,15 @@ class IconiaApp {
   void stopProvisioningBle();
   void handleProvisioningAttempt();
 
+  // Boot-time guards
+  bool placeholderSecretsPresent() const;
+  void haltOnPlaceholderSecrets();
+
+  // BLE secure-mode helpers (no-ops when kBleSecureMode is false)
+  void generateProvisioningNonce();
+  bool provisioningNonceValid() const;
+  void publishProvisioningNonce(BLECharacteristic* nonceCharacteristic);
+
   NextAction runEventFlow(const WifiCredentials& creds);
 
   Preferences preferences_;
@@ -136,6 +145,12 @@ class IconiaApp {
 
   BLEServer* bleServer_ = nullptr;
   BLECharacteristic* bleStatusCharacteristic_ = nullptr;
+  BLECharacteristic* bleNonceCharacteristic_ = nullptr;
+
+  // 16-byte one-time provisioning nonce (only populated when kBleSecureMode).
+  uint8_t provisioningNonce_[16] = {0};
+  unsigned long provisioningNonceMs_ = 0;
+  bool provisioningNonceValid_ = false;
 
   friend class ProvisioningServerCallbacks;
   friend class SsidCallbacks;

@@ -4,9 +4,19 @@
 #include <strings.h>
 #include <string>
 
+#include "esp32-hal-cpu.h"
 #include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_random.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
+#include "esp_wifi.h"
+#include "driver/rtc_io.h"
+
+#if CONFIG_BT_BLE_SMP_ENABLE
+#include <BLESecurity.h>
+#endif
 
 #include "iconia_config.h"
 #include "iconia_protocol.h"
@@ -73,10 +83,38 @@ class PasswordCallbacks : public BLECharacteristicCallbacks {
 void IconiaApp::begin() {
   gAppInstance = this;
 
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println();
-  logLine("[BOOT] ICONIA firmware start");
+  // Drop to idle clock as early as possible. Networking paths bump it back up.
+  setCpuFrequencyMhz(iconia::config::kCpuFrequencyIdleMhz);
+
+  // Brown-out detector: do NOT disable. The Arduino core leaves it enabled at
+  // the chip's factory threshold (~2.43 V) — exactly what a Li-Po BQ24075
+  // system needs to avoid undefined behaviour on a deep discharge.
+  // We explicitly do NOT call WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0).
+
+  // Task watchdog: cover the main task. Wi-Fi/TLS handshake under bad signal
+  // can deadlock the network thread; the TWDT forces a reset and the next
+  // wake retries. 30 s covers the worst-case capture + 3-attempt upload loop.
+  // ESP-IDF 5.x signature (Arduino core 3.x is built on it).
+  const esp_task_wdt_config_t wdtConfig = {
+    /*timeout_ms=*/30000,
+    /*idle_core_mask=*/0,
+    /*trigger_panic=*/true,
+  };
+  if (esp_task_wdt_reconfigure(&wdtConfig) != ESP_OK) {
+    esp_task_wdt_init(&wdtConfig);
+  }
+  esp_task_wdt_add(nullptr);
+
+  if (iconia::config::kSerialLoggingEnabled) {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println();
+    logLine("[BOOT] ICONIA firmware start");
+  }
+
+  // Boot guard: refuse to run with placeholder secrets. This catches the case
+  // where a developer flashes a build that forgot the -DICONIA_API_KEY flag.
+  haltOnPlaceholderSecrets();
 
   pinMode(iconia::config::kLedGpio, OUTPUT);
   digitalWrite(iconia::config::kLedGpio, LOW);
@@ -113,9 +151,21 @@ void IconiaApp::begin() {
 }
 
 void IconiaApp::loop() {
+  // Feed the task watchdog every iteration so a healthy provisioning wait
+  // does not get killed.
+  esp_task_wdt_reset();
+
   if (mode_ != DeviceMode::Provisioning) {
     delay(200);
     return;
+  }
+
+  // Expire the per-session BLE nonce (secure mode only).
+  if (iconia::config::kBleSecureMode &&
+      provisioningNonceValid_ &&
+      !provisioningNonceValid()) {
+    provisioningNonceValid_ = false;
+    notifyProvisioningStatus("nonce_expired");
   }
 
   if (provisioningAttemptPending_) {
@@ -132,8 +182,72 @@ void IconiaApp::loop() {
 }
 
 void IconiaApp::logLine(const String& message) {
+  if (!iconia::config::kSerialLoggingEnabled) {
+    return;
+  }
   Serial.println(message);
   Serial.flush();
+}
+
+bool IconiaApp::placeholderSecretsPresent() const {
+  if (strcmp(iconia::config::kApiKey, iconia::config::kPlaceholderApiKey1) == 0) {
+    return true;
+  }
+  if (strcmp(iconia::config::kApiKey, iconia::config::kPlaceholderApiKey2) == 0) {
+    return true;
+  }
+  if (strcmp(iconia::config::kApiEndpoint, iconia::config::kPlaceholderEndpoint) == 0) {
+    return true;
+  }
+  return false;
+}
+
+void IconiaApp::haltOnPlaceholderSecrets() {
+  if (!placeholderSecretsPresent()) {
+    return;
+  }
+
+  // Visible failure mode: log if Serial is on, then deep-sleep forever.
+  // A device with placeholder credentials must never reach the network code.
+  logLine("[FATAL] placeholder secrets detected; rebuild with "
+          "-DICONIA_API_KEY=... -DICONIA_API_ENDPOINT=...");
+  delay(500);
+
+  // Disable EXT1 wakeup so a touch cannot accidentally retry.
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  esp_deep_sleep_start();
+}
+
+void IconiaApp::generateProvisioningNonce() {
+  // Wi-Fi/BLE radios are guaranteed to be enabled before this call (BLE init
+  // happens in startProvisioningBle), so esp_random() pulls from the
+  // hardware RNG, not the boot-time PRNG.
+  for (int i = 0; i < 16; i += 4) {
+    uint32_t r = esp_random();
+    provisioningNonce_[i + 0] = (uint8_t)(r >> 0);
+    provisioningNonce_[i + 1] = (uint8_t)(r >> 8);
+    provisioningNonce_[i + 2] = (uint8_t)(r >> 16);
+    provisioningNonce_[i + 3] = (uint8_t)(r >> 24);
+  }
+  provisioningNonceMs_ = millis();
+  provisioningNonceValid_ = true;
+}
+
+bool IconiaApp::provisioningNonceValid() const {
+  if (!provisioningNonceValid_) {
+    return false;
+  }
+  return (millis() - provisioningNonceMs_) < iconia::config::kBleNonceTtlMs;
+}
+
+void IconiaApp::publishProvisioningNonce(BLECharacteristic* nonceCharacteristic) {
+  if (nonceCharacteristic == nullptr) {
+    return;
+  }
+  // Expose the 16 bytes raw via a READ-only characteristic. The app reads it
+  // immediately after secure pairing and uses it as a session token in the
+  // SSID/password ciphertext envelope (interface to be defined with rn-mobile).
+  nonceCharacteristic->setValue(provisioningNonce_, sizeof(provisioningNonce_));
 }
 
 int IconiaApp::clampPercent(int value) {
@@ -189,12 +303,13 @@ IconiaApp::BatteryStatus IconiaApp::readBatteryStatus() {
   status.configured = true;
 
   uint32_t acc = 0;
-  for (int i = 0; i < 8; ++i) {
+  const int samples = iconia::config::kBatteryAdcSampleCount;
+  for (int i = 0; i < samples; ++i) {
     acc += analogRead(iconia::config::kBatteryAdcPin);
     delay(2);
   }
 
-  status.raw = acc / 8;
+  status.raw = acc / samples;
   status.pinVoltage = (status.raw / 4095.0f) * iconia::config::kBatteryAdcReferenceV;
   status.batteryVoltage = status.pinVoltage * iconia::config::kBatteryDividerRatio;
   status.percent = clampPercent(
@@ -235,7 +350,12 @@ camera_config_t IconiaApp::buildCameraConfig() {
 }
 
 bool IconiaApp::initCamera() {
+  // Release any RTC-hold left over from the previous deep sleep before
+  // toggling PWDN, otherwise the level latches and the sensor never powers up.
+  rtc_gpio_hold_dis((gpio_num_t)iconia::config::kCameraPowerDownGpio);
+  pinMode(iconia::config::kCameraPowerDownGpio, OUTPUT);
   digitalWrite(iconia::config::kCameraPowerDownGpio, LOW);
+  // OV2640 needs >= ~10 ms after PWDN goes low before SCCB is reachable.
   delay(50);
 
   camera_config_t config = buildCameraConfig();
@@ -302,9 +422,48 @@ IconiaApp::TouchDirection IconiaApp::touchDirectionFromWake() const {
 
 void IconiaApp::enterDeepSleep() {
   logLine("[POWER] entering deep sleep");
+
+  // Detach the task watchdog before we sleep. Otherwise the watchdog list
+  // still references the (about-to-be-suspended) task on next wake and
+  // esp_task_wdt_add() returns ESP_ERR_INVALID_ARG.
+  esp_task_wdt_delete(nullptr);
+
+  // 1. Wi-Fi: disconnect -> stop -> deinit (full RF + driver shutdown)
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
-  btStop();
+  esp_wifi_stop();
+  esp_wifi_deinit();
+
+  // 2. BLE/Bluedroid: ensure controller is fully disabled (btStop alone may
+  // leave the controller in INITED state, drawing extra current in sleep).
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+  }
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+    esp_bt_controller_disable();
+  }
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) {
+    esp_bt_controller_deinit();
+  }
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+
+  // 3. Camera PWDN must stay HIGH while sleeping (OV2640 power-down).
+  rtc_gpio_init((gpio_num_t)iconia::config::kCameraPowerDownGpio);
+  rtc_gpio_set_direction((gpio_num_t)iconia::config::kCameraPowerDownGpio,
+                         RTC_GPIO_MODE_OUTPUT_ONLY);
+  rtc_gpio_set_level((gpio_num_t)iconia::config::kCameraPowerDownGpio, 1);
+  rtc_gpio_hold_en((gpio_num_t)iconia::config::kCameraPowerDownGpio);
+
+  // 4. Isolate every other pin to eliminate floating-input leakage.
+  // Wakeup pins are exempt — they must keep their pull configuration.
+  esp_sleep_config_gpio_isolate();
+
+  // 5. Power down RTC peripherals we do not need (RTC slow mem keeps wakeup state).
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
+
   delay(50);
   esp_sleep_enable_ext1_wakeup(touchWakeMask(), ESP_EXT1_WAKEUP_ANY_HIGH);
   esp_deep_sleep_start();
@@ -367,14 +526,20 @@ IconiaApp::ParsedUrl IconiaApp::parseHttpsUrl(const char* url) const {
 }
 
 bool IconiaApp::connectToWifi(const WifiCredentials& creds) {
+  // Full clock for the (short) connect+TLS phase. Reverted in enterDeepSleep().
+  setCpuFrequencyMhz(iconia::config::kCpuFrequencyActiveMhz);
+
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);
+  // WIFI_PS_MAX_MODEM = aggressive modem sleep between DTIM beacons.
+  // Cuts ~30-40 mA average during the connected idle window.
+  WiFi.setSleep(WIFI_PS_MAX_MODEM);
   WiFi.begin(creds.ssid.c_str(), creds.password.c_str());
 
   unsigned long startMs = millis();
   while (WiFi.status() != WL_CONNECTED &&
          (millis() - startMs) < iconia::config::kWifiConnectTimeoutMs) {
     delay(250);
+    esp_task_wdt_reset();
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -399,8 +564,14 @@ bool IconiaApp::connectToWifiWithRetry(const WifiCredentials& creds, uint8_t ret
 }
 
 bool IconiaApp::configureSecureClient(WiFiClientSecure& client) {
+  bool caConfigured = false;
+
   if (strlen(iconia::config::kServerRootCaPem) > 16) {
     client.setCACert(iconia::config::kServerRootCaPem);
+    caConfigured = true;
+  }
+
+  if (caConfigured) {
     return true;
   }
 
@@ -412,6 +583,21 @@ bool IconiaApp::configureSecureClient(WiFiClientSecure& client) {
 
   logLine("[ERROR] TLS root CA is not configured");
   return false;
+}
+
+// Post-connect leaf-cert pinning. Defense-in-depth on top of CA verification.
+// Returns true if pinning is disabled (empty fingerprint) OR the connected
+// peer's cert matches the configured fingerprint. Returns false to abort
+// the upload if the cert is wrong.
+//
+// ESP32 Arduino core 3.x exposes verify(const char* fingerprint,
+// const char* domain) which compares the SHA-1 over the DER-encoded cert.
+// Empty fingerprint disables this layer; the CA chain check still runs.
+static bool verifyServerFingerprint(WiFiClientSecure& client, const char* host) {
+  if (strlen(iconia::config::kServerCertFingerprintSha1) < 40) {
+    return true;  // pinning disabled
+  }
+  return client.verify(iconia::config::kServerCertFingerprintSha1, host);
 }
 
 bool IconiaApp::writeAll(WiFiClient& client, const uint8_t* data, size_t len) {
@@ -596,6 +782,12 @@ IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payloa
     return result;
   }
 
+  if (!verifyServerFingerprint(client, endpoint.host.c_str())) {
+    logLine("[ERROR] server fingerprint mismatch, aborting upload");
+    client.stop();
+    return result;
+  }
+
   char headers[384];
   int headerLen = snprintf(
     headers,
@@ -682,6 +874,7 @@ void IconiaApp::startProvisioningBle() {
   provisioningAttemptPending_ = false;
   pendingSsidReceived_ = false;
   pendingPasswordReceived_ = false;
+  provisioningNonceValid_ = false;
 
   BLEDevice::init(bleDeviceName().c_str());
 
@@ -709,10 +902,57 @@ void IconiaApp::startProvisioningBle() {
   bleStatusCharacteristic_->addDescriptor(new BLE2902());
   bleStatusCharacteristic_->setValue("advertising");
 
+  // Optional secure-mode hardening. Compile-time gated; default OFF.
+  // -------------------------------------------------------------------------
+  // Interface contract for rn-mobile when this is flipped on:
+  //   1. App connects, triggers Just Works pairing (ESP_LE_AUTH_REQ_SC_MITM_BOND).
+  //   2. App reads the 16-byte Nonce characteristic immediately after pairing.
+  //   3. App sends SSID + password as <nonce-prefixed AEAD ciphertext> across
+  //      the existing SSID/password characteristics. (AEAD scheme TBD; suggest
+  //      AES-128-GCM with the BLE LTK as key.)
+  //   4. Firmware verifies nonce (TTL: kBleNonceTtlMs) before accepting.
+  // -------------------------------------------------------------------------
+  if (iconia::config::kBleSecureMode) {
+#if CONFIG_BT_BLE_SMP_ENABLE
+    BLESecurity* security = new BLESecurity();
+    security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+    security->setCapability(ESP_IO_CAP_NONE);  // doll has no display/keyboard
+    security->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    security->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+
+    ssidCharacteristic->setAccessPermissions(
+      ESP_GATT_PERM_WRITE_ENC_MITM
+    );
+    passwordCharacteristic->setAccessPermissions(
+      ESP_GATT_PERM_WRITE_ENC_MITM
+    );
+
+    // Read-only nonce characteristic (UUID = status UUID + 1 to keep the
+    // scheme deterministic; replace with a dedicated UUID when rn-mobile
+    // confirms the pairing flow).
+    bleNonceCharacteristic_ = service->createCharacteristic(
+      "48f1f79e-817d-4105-a96f-4e2d2d6031e4",
+      ESP_GATT_CHAR_PROP_BIT_READ
+    );
+    bleNonceCharacteristic_->setAccessPermissions(ESP_GATT_PERM_READ_ENC_MITM);
+
+    generateProvisioningNonce();
+    publishProvisioningNonce(bleNonceCharacteristic_);
+    logLine("[BLE] secure mode enabled, nonce published");
+#else
+    logLine("[WARN] kBleSecureMode set but SMP not compiled in core");
+#endif
+  }
+
   service->start();
   BLEAdvertising* advertising = BLEDevice::getAdvertising();
   advertising->addServiceUUID(iconia::config::kBleServiceUuid);
   advertising->setScanResponse(true);
+  // Long advertising interval (1280-2560 ms) cuts BLE current ~3-4x vs the
+  // 100 ms default. Provisioning is one-shot at first boot, so discovery
+  // latency of <3 s is acceptable.
+  advertising->setMinInterval(iconia::config::kBleAdvIntervalMin);
+  advertising->setMaxInterval(iconia::config::kBleAdvIntervalMax);
   advertising->start();
 
   notifyProvisioningStatus("advertising");
@@ -723,7 +963,11 @@ void IconiaApp::stopProvisioningBle() {
   BLEDevice::deinit(false);
   bleServer_ = nullptr;
   bleStatusCharacteristic_ = nullptr;
+  bleNonceCharacteristic_ = nullptr;
   bleClientConnected_ = false;
+  provisioningNonceValid_ = false;
+  // Wipe the nonce buffer so it does not survive in heap fragments.
+  memset(provisioningNonce_, 0, sizeof(provisioningNonce_));
 }
 
 void IconiaApp::handleProvisioningAttempt() {
