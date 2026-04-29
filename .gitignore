@@ -1,0 +1,10 @@
+build/
+.pio/
+.vscode/
+*.bin
+*.elf
+*.hex
+*.log
+*.bak
+*.tmp
+.DS_Store
