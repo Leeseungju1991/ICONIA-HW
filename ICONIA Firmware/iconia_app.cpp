@@ -13,6 +13,13 @@
 #include "esp_wifi.h"
 #include "driver/rtc_io.h"
 
+// OTA 관련 ESP-IDF API. Arduino-ESP32 core 3.x는 ESP-IDF 5.x 기반이므로
+// 그대로 include 가능.
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "mbedtls/sha256.h"
+
 #if CONFIG_BT_BLE_SMP_ENABLE
 #include <BLESecurity.h>
 #endif
@@ -117,7 +124,14 @@ void IconiaApp::begin() {
 
   // Boot guard: refuse to run with placeholder secrets. This catches the case
   // where a developer flashes a build that forgot the -DICONIA_API_KEY flag.
+  // 동일 가드에 firmware_version placeholder("0.0.0-placeholder")도 함께 걸린다
+  // (placeholderSecretsPresent() 내부 검사).
   haltOnPlaceholderSecrets();
+
+  // OTA 자가점검 안내 로그. 실제 mark는 첫 정상 업로드 성공 직후 호출.
+  // (현재 부팅이 OTA 직후의 검증 부팅인지 여기서는 로그만 남기고 판단 자체는
+  // markAppValidIfPending 내부에서 ota_state 조회로 수행한다.)
+  logLine(String("[BOOT] firmware version: ") + iconia::config::kFirmwareVersion);
 
   pinMode(iconia::config::kLedGpio, OUTPUT);
   digitalWrite(iconia::config::kLedGpio, LOW);
@@ -200,6 +214,11 @@ bool IconiaApp::placeholderSecretsPresent() const {
     return true;
   }
   if (strcmp(iconia::config::kApiEndpoint, iconia::config::kPlaceholderEndpoint) == 0) {
+    return true;
+  }
+  // firmware_version placeholder는 OTA 롤백 추적을 무력화하므로 동일하게 차단.
+  if (strcmp(iconia::config::kFirmwareVersion,
+             iconia::config::kPlaceholderFirmwareVersion) == 0) {
     return true;
   }
   return false;
@@ -703,9 +722,18 @@ bool IconiaApp::writeMultipartImageHeader(WiFiClient& client, const char* bounda
   return writeAll(client, reinterpret_cast<const uint8_t*>(header), static_cast<size_t>(headerLen));
 }
 
+// HTTP 응답 헤더에서 명령(enter_provisioning / ota)과 OTA 동반 헤더를 파싱.
+// OTA 진입 시점의 URL은 절대 응답 본문에 노출되어선 안 되므로(presigned 서명
+// 누설), 본문 토큰 백업 검색은 enter_provisioning 한정으로만 유지한다.
+// OTA 헤더 형식 검증/가드 자체는 호출자(canEnterOta)가 수행한다.
 IconiaApp::UploadResult IconiaApp::readHttpResponseAndCommand(WiFiClientSecure& client) {
-  UploadResult result = {false, NextAction::None};
-  char line[160];
+  UploadResult result = {};
+  result.success = false;
+  result.nextAction = NextAction::None;
+  result.ota.present = false;
+  result.ota.sizeBytes = -1;
+
+  char line[256];  // OTA presigned URL 길이 여유분(쿼리 스트링 ~수백자 가능)
 
   if (!readLine(client, line, sizeof(line))) {
     return result;
@@ -732,17 +760,34 @@ IconiaApp::UploadResult IconiaApp::readHttpResponseAndCommand(WiFiClientSecure& 
     char* value = skipSpaces(colon + 1);
     trimRight(value);
 
-    if (strcasecmp(line, iconia::protocol::kCommandHeader) == 0 &&
-        strcasecmp(value, iconia::protocol::kCommandEnterProvisioning) == 0) {
-      result.nextAction = NextAction::EnterProvisioning;
+    if (strcasecmp(line, iconia::protocol::kCommandHeader) == 0) {
+      if (strcasecmp(value, iconia::protocol::kCommandEnterProvisioning) == 0) {
+        result.nextAction = NextAction::EnterProvisioning;
+      } else if (strcasecmp(value, iconia::protocol::kCommandOta) == 0) {
+        result.nextAction = NextAction::Ota;
+      }
+    } else if (strcasecmp(line, iconia::protocol::kOtaUrlHeader) == 0) {
+      result.ota.url = String(value);
+      result.ota.present = true;
+    } else if (strcasecmp(line, iconia::protocol::kOtaSha256Header) == 0) {
+      result.ota.sha256 = String(value);
+      result.ota.present = true;
+    } else if (strcasecmp(line, iconia::protocol::kOtaVersionHeader) == 0) {
+      result.ota.version = String(value);
+      result.ota.present = true;
+    } else if (strcasecmp(line, iconia::protocol::kOtaSizeHeader) == 0) {
+      result.ota.sizeBytes = (int64_t)strtoll(value, nullptr, 10);
     }
   }
 
+  // 본문 백업 토큰 검색은 enter_provisioning 전용. OTA 명령은 절대 본문에서
+  // 캐치하지 않는다(presigned URL이 본문에 떠 있으면 보안 위반이므로 오히려
+  // 무시하는 게 맞다).
   if (client.available()) {
     char body[96];
     size_t bodyLen = client.readBytes(body, sizeof(body) - 1);
     body[bodyLen] = '\0';
-    if (lineHasReprovisionCommand(body)) {
+    if (result.nextAction == NextAction::None && lineHasReprovisionCommand(body)) {
       result.nextAction = NextAction::EnterProvisioning;
     }
   }
@@ -751,7 +796,11 @@ IconiaApp::UploadResult IconiaApp::readHttpResponseAndCommand(WiFiClientSecure& 
 }
 
 IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payload) {
-  UploadResult result = {false, NextAction::None};
+  UploadResult result = {};
+  result.success = false;
+  result.nextAction = NextAction::None;
+  result.ota.present = false;
+  result.ota.sizeBytes = -1;
   ParsedUrl endpoint = parseHttpsUrl(iconia::config::kApiEndpoint);
   if (!endpoint.valid) {
     logLine("[ERROR] invalid API endpoint");
@@ -765,6 +814,8 @@ IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payloa
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldTouch, payload.touch);
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldDeviceId, payload.deviceId);
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldBattery, batteryText);
+  // firmware_version은 OTA 여부와 무관하게 항상 보고 (서버 측 롤아웃 추적용).
+  contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldFirmwareVersion, iconia::config::kFirmwareVersion);
   contentLength += multipartImageHeaderLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldImage, iconia::protocol::kImageFileName);
   contentLength += payload.imageLen;
   contentLength += strlen("\r\n--") + strlen(iconia::config::kMultipartBoundary) + strlen("--\r\n");
@@ -810,6 +861,7 @@ IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payloa
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldTouch, payload.touch) ||
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldDeviceId, payload.deviceId) ||
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldBattery, batteryText) ||
+      !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldFirmwareVersion, iconia::config::kFirmwareVersion) ||
       !writeMultipartImageHeader(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldImage, iconia::protocol::kImageFileName) ||
       !writeAll(client, payload.imageData, payload.imageLen) ||
       !writeAll(client, reinterpret_cast<const uint8_t*>("\r\n--"), 4) ||
@@ -826,13 +878,21 @@ IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payloa
 }
 
 IconiaApp::UploadResult IconiaApp::uploadEventWithRetry(const EventPayload& payload) {
-  UploadResult result = {false, NextAction::None};
+  UploadResult result = {};
+  result.success = false;
+  result.nextAction = NextAction::None;
+  result.ota.present = false;
+  result.ota.sizeBytes = -1;
 
   for (uint8_t attempt = 1; attempt <= iconia::config::kUploadRetryCount; ++attempt) {
     logLine("[HTTPS] upload attempt " + String(attempt) + "/" + String(iconia::config::kUploadRetryCount));
     result = postEventMultipart(payload);
-    if (result.nextAction == NextAction::EnterProvisioning) {
-      logLine("[HTTPS] server requested reprovisioning");
+    // 명령(EnterProvisioning/Ota)은 success=true 응답에서만 의미 있음.
+    // 명령이 있으면 즉시 반환하여 호출자가 분기할 수 있게 한다.
+    if (result.success &&
+        (result.nextAction == NextAction::EnterProvisioning ||
+         result.nextAction == NextAction::Ota)) {
+      logLine("[HTTPS] server command received");
       return result;
     }
     if (result.success) {
@@ -1046,10 +1106,47 @@ IconiaApp::NextAction IconiaApp::runEventFlow(const WifiCredentials& creds) {
   payload.imageData = frame->buf;
   payload.imageLen = frame->len;
 
+  // OTA 자가점검 신호로 사용할 RSSI 캡처(이 시점은 Wi-Fi 연결 직후이며, OTA
+  // 진입 가드의 입력값으로도 재사용된다).
+  int rssiDbm = WiFi.RSSI();
+
   UploadResult uploadResult = uploadEventWithRetry(payload);
 
   esp_camera_fb_return(frame);
   deinitCamera();
+
+  // 자가 점검: "Wi-Fi 연결 + 서버 200 응답 1회 성공" 정의.
+  // pending_verify 파티션이라면 이 시점에서 mark_app_valid_cancel_rollback.
+  // 일반 부팅(이미 valid)일 때는 no-op.
+  if (uploadResult.success) {
+    markAppValidIfPending();
+  }
+
+  if (uploadResult.success && uploadResult.nextAction == NextAction::Ota) {
+    // OTA 분기. 가드 통과 시 다운로드/플래시. 성공 시 ESP.restart()는 함수
+    // 내부에서 호출하지 않고 여기서 명시(흐름이 한 곳에서 보이도록).
+    if (canEnterOta(uploadResult.ota, battery.percent, rssiDbm)) {
+      // OTA 채널과 이벤트 채널이 동시에 TLS 핸드셰이크를 점유하지 않도록
+      // event Wi-Fi 연결을 유지한 채로 esp_https_ota만 별도로 진행한다
+      // (esp_https_ota는 자체 클라이언트로 새 TCP 연결을 맺는다).
+      bool otaOk = performOta(uploadResult.ota);
+      WiFi.disconnect(true, true);
+      WiFi.mode(WIFI_OFF);
+      if (otaOk) {
+        logLine("[OTA] success, restarting into new partition");
+        delay(200);
+        ESP.restart();  // 새 파티션 부팅 → setup() → 첫 정상 업로드 시 mark_valid
+      } else {
+        logLine("[OTA] failed, sleeping; server will re-issue on next wake");
+      }
+      return NextAction::None;
+    }
+    logLine("[OTA] guard failed, ignoring command this cycle");
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    return NextAction::None;
+  }
+
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
 
@@ -1060,4 +1157,242 @@ IconiaApp::NextAction IconiaApp::runEventFlow(const WifiCredentials& creds) {
   }
 
   return NextAction::None;
+}
+
+// -----------------------------------------------------------------------------
+// OTA 클라이언트 (esp_https_ota 기반)
+// -----------------------------------------------------------------------------
+
+bool IconiaApp::stringStartsWithHttps(const String& s) {
+  return s.length() > 8 && s.startsWith("https://");
+}
+
+bool IconiaApp::hexStringIsLowerSha256(const String& s) {
+  if (s.length() != 64) {
+    return false;
+  }
+  for (size_t i = 0; i < 64; ++i) {
+    char c = s.charAt(i);
+    bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// presigned URL을 시리얼 로그용으로 안전하게 줄임. 호스트명만 노출하고
+// 쿼리 파라미터(서명 포함)는 마스킹. 실수로 평문 로그가 GitHub Actions 등에
+// 캡처되어도 5분 TTL이 만료되기 전 누설되는 위험을 줄인다.
+String IconiaApp::sanitizeUrlForLog(const String& url) const {
+  int schemeEnd = url.indexOf("://");
+  if (schemeEnd < 0) {
+    return String("<invalid-url>");
+  }
+  int hostStart = schemeEnd + 3;
+  int pathStart = url.indexOf('/', hostStart);
+  String host = (pathStart < 0) ? url.substring(hostStart) : url.substring(hostStart, pathStart);
+  return String("https://") + host + "/<masked-path-and-query>";
+}
+
+// OTA 진입 가드. 모두 만족할 때만 true.
+// - OtaCommand 형식 검증 (https URL, 64자 소문자 hex sha256, version 비어있지 않음)
+// - 배터리 >= kBatteryOtaMinPercent
+// - RSSI > kRssiOtaMinDbm
+// - kS3RootCaPem 비어 있고 kAllowInsecureOtaWhenRootCaMissing도 false면 거부
+// 미달 사유는 분류 로깅하여 운영 시 디버깅 가능.
+bool IconiaApp::canEnterOta(const OtaCommand& ota, int batteryPercent, int rssiDbm) const {
+  if (!ota.present) {
+    logLine("[OTA-GUARD] no OTA headers");
+    return false;
+  }
+  if (!stringStartsWithHttps(ota.url)) {
+    logLine("[OTA-GUARD] url is not https");
+    return false;
+  }
+  if (!hexStringIsLowerSha256(ota.sha256)) {
+    logLine("[OTA-GUARD] sha256 invalid (need 64 lower-hex chars)");
+    return false;
+  }
+  if (ota.version.length() == 0) {
+    logLine("[OTA-GUARD] version missing");
+    return false;
+  }
+  if (batteryPercent < iconia::config::kBatteryOtaMinPercent) {
+    logLine(String("[OTA-GUARD] battery ") + batteryPercent + "% < " +
+            iconia::config::kBatteryOtaMinPercent + "%");
+    return false;
+  }
+  if (rssiDbm <= iconia::config::kRssiOtaMinDbm) {
+    logLine(String("[OTA-GUARD] rssi ") + rssiDbm + "dBm <= " +
+            iconia::config::kRssiOtaMinDbm + "dBm");
+    return false;
+  }
+  bool s3CaConfigured = strlen(iconia::config::kS3RootCaPem) > 16;
+  if (!s3CaConfigured && !iconia::config::kAllowInsecureOtaWhenRootCaMissing) {
+    logLine("[OTA-GUARD] S3 root CA missing and insecure OTA not allowed");
+    return false;
+  }
+  return true;
+}
+
+// OTA 다운로드 + 검증 + 플래시. 성공 시 true (호출자가 ESP.restart() 책임).
+// SHA-256 검증은 다운로드 완료 후 update 파티션을 mmap하여 한 번에 계산.
+// 불일치하면 esp_https_ota_abort()로 부분 기록 폐기.
+bool IconiaApp::performOta(const OtaCommand& ota) {
+  logLine(String("[OTA] start version=") + ota.version +
+          " size=" + String((long)ota.sizeBytes) +
+          " url=" + sanitizeUrlForLog(ota.url));
+
+  // Watchdog 임시 연장 → 다운로드 완료/abort 후 default로 복귀.
+  // ESP-IDF 5.x esp_task_wdt_config_t는 POD이므로 두 인스턴스를 미리 만들어둔다.
+  const esp_task_wdt_config_t wdtOta = {
+    /*timeout_ms=*/iconia::config::kWatchdogOtaTimeoutMs,
+    /*idle_core_mask=*/0,
+    /*trigger_panic=*/true,
+  };
+  const esp_task_wdt_config_t wdtDefault = {
+    /*timeout_ms=*/iconia::config::kWatchdogDefaultTimeoutMs,
+    /*idle_core_mask=*/0,
+    /*trigger_panic=*/true,
+  };
+  esp_task_wdt_reconfigure(&wdtOta);
+
+  esp_http_client_config_t httpConfig = {};
+  httpConfig.url = ota.url.c_str();
+  httpConfig.timeout_ms = 15000;
+  httpConfig.keep_alive_enable = true;
+
+  if (strlen(iconia::config::kS3RootCaPem) > 16) {
+    httpConfig.cert_pem = iconia::config::kS3RootCaPem;
+  } else if (iconia::config::kAllowInsecureOtaWhenRootCaMissing) {
+    // bring-up 전용 폴백. canEnterOta에서 이미 정책 검사를 통과한 경우만 도달.
+    httpConfig.skip_cert_common_name_check = true;
+    logLine("[OTA] WARNING insecure mode (no S3 root CA pinned)");
+  }
+
+  esp_https_ota_config_t otaConfig = {};
+  otaConfig.http_config = &httpConfig;
+
+  esp_https_ota_handle_t handle = nullptr;
+  esp_err_t err = esp_https_ota_begin(&otaConfig, &handle);
+  if (err != ESP_OK || handle == nullptr) {
+    logLine(String("[OTA] begin failed err=") + (int)err);
+    esp_task_wdt_reconfigure(&wdtDefault);
+    return false;
+  }
+
+  // 사전 sanity: 서버가 보낸 X-OTA-Size와 HTTP Content-Length 비교.
+  int reportedSize = esp_https_ota_get_image_size(handle);
+  if (ota.sizeBytes > 0 && reportedSize > 0 &&
+      reportedSize != (int)ota.sizeBytes) {
+    logLine(String("[OTA] size mismatch reported=") + reportedSize +
+            " expected=" + String((long)ota.sizeBytes));
+    esp_https_ota_abort(handle);
+    esp_task_wdt_reconfigure(&wdtDefault);
+    return false;
+  }
+
+  // 스트리밍 다운로드. perform()은 청크 단위로 IN_PROGRESS를 반환.
+  while (true) {
+    err = esp_https_ota_perform(handle);
+    if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+      break;
+    }
+    esp_task_wdt_reset();
+  }
+
+  if (err != ESP_OK) {
+    logLine(String("[OTA] perform failed err=") + (int)err);
+    esp_https_ota_abort(handle);
+    esp_task_wdt_reconfigure(&wdtDefault);
+    return false;
+  }
+
+  if (!esp_https_ota_is_complete_data_received(handle)) {
+    logLine("[OTA] incomplete data");
+    esp_https_ota_abort(handle);
+    esp_task_wdt_reconfigure(&wdtDefault);
+    return false;
+  }
+
+  int writtenLen = esp_https_ota_get_image_len_read(handle);
+  logLine(String("[OTA] downloaded bytes=") + writtenLen);
+
+  // SHA-256 검증: esp_https_ota_finish 호출 전에 활성 update 파티션의 실제
+  // 내용을 mmap으로 읽어 해시를 계산. 불일치 시 finish 대신 abort.
+  const esp_partition_t* updatePart = esp_ota_get_next_update_partition(nullptr);
+  if (updatePart == nullptr) {
+    logLine("[OTA] no update partition");
+    esp_https_ota_abort(handle);
+    esp_task_wdt_reconfigure(&wdtDefault);
+    return false;
+  }
+
+  const void* mappedPtr = nullptr;
+  esp_partition_mmap_handle_t mapHandle = 0;
+  if (esp_partition_mmap(updatePart, 0, writtenLen, ESP_PARTITION_MMAP_DATA,
+                         &mappedPtr, &mapHandle) != ESP_OK) {
+    logLine("[OTA] mmap failed for sha256 verify");
+    esp_https_ota_abort(handle);
+    esp_task_wdt_reconfigure(&wdtDefault);
+    return false;
+  }
+
+  uint8_t digest[32];
+  mbedtls_sha256_context shaCtx;
+  mbedtls_sha256_init(&shaCtx);
+  mbedtls_sha256_starts(&shaCtx, 0 /* SHA-256 (not 224) */);
+  mbedtls_sha256_update(&shaCtx, (const unsigned char*)mappedPtr, writtenLen);
+  mbedtls_sha256_finish(&shaCtx, digest);
+  mbedtls_sha256_free(&shaCtx);
+  esp_partition_munmap(mapHandle);
+
+  char hexDigest[65];
+  for (int i = 0; i < 32; ++i) {
+    snprintf(hexDigest + i * 2, 3, "%02x", digest[i]);
+  }
+  hexDigest[64] = '\0';
+
+  if (ota.sha256 != String(hexDigest)) {
+    logLine(String("[OTA] sha256 mismatch expected=") + ota.sha256 +
+            " got=" + String(hexDigest));
+    esp_https_ota_abort(handle);
+    esp_task_wdt_reconfigure(&wdtDefault);
+    return false;
+  }
+  logLine("[OTA] sha256 verified");
+
+  err = esp_https_ota_finish(handle);
+  // Watchdog 즉시 복귀(restart 전이어도 안전 측에서).
+  esp_task_wdt_reconfigure(&wdtDefault);
+
+  if (err != ESP_OK) {
+    logLine(String("[OTA] finish failed err=") + (int)err);
+    return false;
+  }
+  return true;
+}
+
+// 새 펌웨어 부팅 직후의 자가점검 통과 처리.
+// ota_state가 ESP_OTA_IMG_PENDING_VERIFY인 경우만 mark_valid_cancel_rollback.
+// 그 외(이미 valid거나 부팅 안 됨 등)는 no-op. 호출은 첫 정상 업로드 성공 후.
+void IconiaApp::markAppValidIfPending() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (running == nullptr) {
+    return;
+  }
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (esp_ota_get_state_partition(running, &state) != ESP_OK) {
+    return;
+  }
+  if (state != ESP_OTA_IMG_PENDING_VERIFY) {
+    return;  // 일반 부팅, 할 일 없음
+  }
+  esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+  if (err == ESP_OK) {
+    logLine("[OTA] self-test passed, marked app valid (rollback cancelled)");
+  } else {
+    logLine(String("[OTA] mark_valid failed err=") + (int)err);
+  }
 }

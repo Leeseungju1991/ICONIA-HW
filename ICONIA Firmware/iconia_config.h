@@ -56,10 +56,61 @@ static constexpr const char* kPlaceholderApiKey1 = "REPLACE_WITH_API_KEY";
 static constexpr const char* kPlaceholderApiKey2 = "CHANGE_ME_LONG_RANDOM_DEVICE_KEY";
 static constexpr const char* kPlaceholderEndpoint = "https://api.example.com/api/event";
 
+// -----------------------------------------------------------------------------
+// Firmware version (semver). 서버에 매 /api/event 요청마다 firmware_version
+// 필드로 보고됨. OTA 후 자가 점검(첫 정상 업로드 성공) 시점에서 새 버전이
+// 서버 로그에 노출됨으로써 롤아웃 진척을 추적할 수 있다.
+//
+// placeholder("0.0.0-placeholder")는 부팅 가드로 차단된다. factory flash
+// 또는 빌드 매크로로 반드시 실제 버전을 주입해야 한다:
+//   -DICONIA_FIRMWARE_VERSION="\"1.0.0\""
+// -----------------------------------------------------------------------------
+#ifdef ICONIA_FIRMWARE_VERSION
+static constexpr const char* kFirmwareVersion = ICONIA_FIRMWARE_VERSION;
+#else
+static constexpr const char* kFirmwareVersion = "0.0.0-placeholder";
+#endif
+static constexpr const char* kPlaceholderFirmwareVersion = "0.0.0-placeholder";
+
 // Set the production root CA at flashing time (or load from NVS).
 static constexpr const char* kServerRootCaPem = R"PEM(
 
 )PEM";
+
+// S3 presigned URL용 별도 root CA. Amazon Trust Services 체인이 server
+// 엔드포인트 발급 CA와 다를 수 있으므로 분리. 운영에서는 빌드 시점에
+// AmazonRootCA1.pem 등을 매크로로 주입한다:
+//   -DICONIA_S3_ROOT_CA_PEM="\"-----BEGIN CERTIFICATE-----\\n...\""
+// 비어 있으면 OTA 진입 자체가 거부된다(setInsecure 폴백 금지).
+#ifdef ICONIA_S3_ROOT_CA_PEM
+static constexpr const char* kS3RootCaPem = ICONIA_S3_ROOT_CA_PEM;
+#else
+static constexpr const char* kS3RootCaPem = R"PEM(
+
+)PEM";
+#endif
+
+// 운영 가드: kS3RootCaPem이 비어 있는 상태에서 OTA를 시도하면 업로드된
+// 펌웨어 무결성을 보장할 수 없으므로 거부. ICONIA_ALLOW_INSECURE_OTA=1을
+// 명시한 경우에만 setInsecure 허용(개발 bring-up 전용).
+#ifdef ICONIA_ALLOW_INSECURE_OTA
+static constexpr bool kAllowInsecureOtaWhenRootCaMissing = (ICONIA_ALLOW_INSECURE_OTA != 0);
+#else
+static constexpr bool kAllowInsecureOtaWhenRootCaMissing = false;
+#endif
+
+// OTA 진입 가드 임계값.
+// - 배터리 50% 이상에서만 시도 (다운로드+플래시 + 자가점검 부팅 = 200mA 수준이
+//   수십 초 지속, 잔량 부족 시 중단되면 롤백 파티션 부팅 → 재시도 루프 위험)
+// - RSSI -75 dBm 보다 좋아야 시도 (TLS 다운로드 도중 끊기면 불완전 펌웨어 위험)
+static constexpr int kBatteryOtaMinPercent = 50;
+static constexpr int kRssiOtaMinDbm = -75;
+
+// OTA 다운로드/플래시 동안 임시로 늘리는 watchdog timeout.
+// 1.5MB 펌웨어 + 느린 Wi-Fi(~200kbps)에서 60초가 안전 마진.
+// OTA 종료 후 kWatchdogDefaultTimeoutMs로 복귀.
+static constexpr uint32_t kWatchdogOtaTimeoutMs = 60000;
+static constexpr uint32_t kWatchdogDefaultTimeoutMs = 30000;
 
 // SECURITY: must be false in production. setInsecure() disables certificate
 // validation and exposes the device to MITM. Override at compile time only

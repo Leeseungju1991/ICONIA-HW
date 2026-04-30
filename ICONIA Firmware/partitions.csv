@@ -1,0 +1,24 @@
+# ICONIA dual-OTA partition table for ESP32-CAM 4MB flash.
+#
+# WHY: 기본 "Huge APP" (3MB single app)은 OTA 미지원. OTA 도입을 위해
+# app0 / app1 듀얼 슬롯 + otadata + nvs로 재배치한다. 카메라 framebuffer는
+# PSRAM에 잡히므로 SPIFFS 영역을 줄여도 영향 없음.
+#
+# Arduino IDE 적용:
+#   Tools > Partition Scheme > "Custom" 선택 후 이 파일을 sketch 폴더에 두면
+#   Arduino-ESP32 core 3.x가 자동으로 partitions.csv를 인식한다.
+#   (또는 boards.txt의 esp32cam.menu.PartitionScheme.custom 항목을 활성화)
+#
+# 레이아웃 (총 4MB = 0x400000):
+#   0x009000  nvs       0x005000  (20KB)  Wi-Fi 자격증명, OTA 시도 카운트
+#   0x00E000  otadata   0x002000  ( 8KB)  현재 부팅 슬롯 + pending_verify 상태
+#   0x010000  app0      0x180000  (1.5MB) factory + 첫 OTA 슬롯
+#   0x190000  app1      0x180000  (1.5MB) 두 번째 OTA 슬롯
+#   0x310000  spiffs    0x0F0000  (~960KB) 향후 펌웨어 임시 파일/로그 (현재 미사용)
+#
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x180000,
+app1,     app,  ota_1,   0x190000, 0x180000,
+spiffs,   data, spiffs,  0x310000, 0xF0000,

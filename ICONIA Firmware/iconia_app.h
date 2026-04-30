@@ -36,6 +36,18 @@ class IconiaApp {
   enum class NextAction : uint8_t {
     None,
     EnterProvisioning,
+    Ota,
+  };
+
+  // 서버가 ota 명령과 함께 동봉한 헤더 묶음. 진입 가드 통과 시에만 실제 사용.
+  // url은 S3 presigned(쿼리 파라미터에 서명 포함, 5분 TTL). 로깅 시 호스트만
+  // 노출하고 쿼리는 마스킹할 것.
+  struct OtaCommand {
+    String url;
+    String sha256;     // 소문자 hex 64자
+    String version;    // semver, sanity/log 용도
+    int64_t sizeBytes; // 선택. -1이면 미지정.
+    bool present;
   };
 
   struct WifiCredentials {
@@ -64,6 +76,7 @@ class IconiaApp {
   struct UploadResult {
     bool success;
     NextAction nextAction;
+    OtaCommand ota;
   };
 
   struct ParsedUrl {
@@ -124,6 +137,19 @@ class IconiaApp {
   // Boot-time guards
   bool placeholderSecretsPresent() const;
   void haltOnPlaceholderSecrets();
+
+  // OTA 클라이언트 (esp_https_ota 기반).
+  // performOta: presigned URL 다운로드 → SHA-256 검증 → 듀얼 파티션 플래시.
+  //             성공 반환 후 호출자는 ESP.restart() 해야 함.
+  // canEnterOta: 가드 사전 검사(배터리/RSSI/계약 헤더 형식). 미달 사유 로깅.
+  // sanitizeUrlForLog: presigned URL의 쿼리(서명) 마스킹.
+  // markAppValidIfPending: pending_verify 파티션이면 자가점검 통과 표시.
+  bool canEnterOta(const OtaCommand& ota, int batteryPercent, int rssiDbm) const;
+  bool performOta(const OtaCommand& ota);
+  String sanitizeUrlForLog(const String& url) const;
+  void markAppValidIfPending();
+  static bool hexStringIsLowerSha256(const String& s);
+  static bool stringStartsWithHttps(const String& s);
 
   // BLE secure-mode helpers (no-ops when kBleSecureMode is false)
   void generateProvisioningNonce();
