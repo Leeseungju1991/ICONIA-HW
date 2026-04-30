@@ -8,3 +8,8 @@ build/
 *.bak
 *.tmp
 .DS_Store
+
+# Build profile output — 정본은 build_profiles/<env>.h
+# build.sh / build.bat 가 이 파일을 매 빌드마다 덮어쓴다.
+ICONIA Firmware/build_opt.h
+build_opt.h

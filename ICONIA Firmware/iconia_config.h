@@ -14,22 +14,29 @@ namespace config {
 // the file still compiles in a fresh checkout, but a runtime guard in
 // IconiaApp::begin() halts the device if a placeholder is detected at boot.
 //
-// Arduino IDE (1.x / 2.x):
-//   Create a sibling file `build_opt.h` in the sketch folder containing:
-//     -DICONIA_API_ENDPOINT="\"https://api.iconia.example.com/api/event\""
-//     -DICONIA_API_KEY="\"<32+ char random key from secrets manager>\""
-//     -DICONIA_CERT_FP_SHA1="\"AA:BB:...:99\""   // optional, see below
-//   The Arduino build system reads `build_opt.h` automatically (since core
-//   1.6.x). Do NOT commit this file.
+// 권장 흐름 — Build Profiles (./build.sh dev | prod):
+//   매크로 정본은 build_profiles/dev.h / prod.h 에 박아 두고, 빌드 스크립트
+//   (build.sh / build.bat) 가 선택된 profile 을 sketch 폴더의 build_opt.h 로
+//   복사한다. build_opt.h 는 .gitignore 대상.
+//   상세: ICONIA Firmware/build_profiles/README.md 참조.
 //
-// arduino-cli:
-//   arduino-cli compile \
-//     --build-property "build.extra_flags=\
-//       -DICONIA_API_ENDPOINT=\\\"https://...\\\" \
-//       -DICONIA_API_KEY=\\\"...\\\""
+// 수동(프로파일 미사용) 절차도 호환:
+//   Arduino IDE (1.x / 2.x):
+//     Create a sibling file `build_opt.h` in the sketch folder containing:
+//       -DICONIA_API_ENDPOINT="\"https://api.iconia.example.com/api/event\""
+//       -DICONIA_API_KEY="\"<32+ char random key from secrets manager>\""
+//       -DICONIA_CERT_FP_SHA1="\"AA:BB:...:99\""   // optional, see below
+//     The Arduino build system reads `build_opt.h` automatically (since core
+//     1.6.x). Do NOT commit this file.
 //
-// PlatformIO equivalent (if migrated later):
-//   build_flags = -DICONIA_API_KEY="\"...\""
+//   arduino-cli:
+//     arduino-cli compile \
+//       --build-property "build.extra_flags=\
+//         -DICONIA_API_ENDPOINT=\\\"https://...\\\" \
+//         -DICONIA_API_KEY=\\\"...\\\""
+//
+//   PlatformIO equivalent (if migrated later):
+//     build_flags = -DICONIA_API_KEY="\"...\""
 // -----------------------------------------------------------------------------
 
 // Production endpoint. Final value is loaded from NVS (key: "api_endpoint") at
