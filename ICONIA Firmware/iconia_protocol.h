@@ -22,12 +22,26 @@ static constexpr const char* kFieldBattery = "battery";
 static constexpr const char* kFieldImage = "image";
 // 모든 /api/event 요청에 항상 포함되는 펌웨어 자기보고 필드.
 static constexpr const char* kFieldFirmwareVersion = "firmware_version";
+// 직전 OTA 시도 결과 보고 필드(옵션 페어). 보고할 결과가 없으면 두 필드 모두
+// multipart에서 생략. 한 쪽만 있으면 서버가 무시하므로 항상 페어로 emit.
+// aws-infra와 합의된 정확한 필드명. 절대 임의 변경 금지.
+static constexpr const char* kFieldLastOtaResult = "last_ota_result";
+static constexpr const char* kFieldLastOtaAttemptedVersion = "last_ota_attempted_version";
 static constexpr const char* kImageFileName = "event.jpg";
 static constexpr const char* kImageContentType = "image/jpeg";
 
 static constexpr const char* kTouchLeft = "left";
 static constexpr const char* kTouchRight = "right";
 static constexpr const char* kTouchNone = "none";
+
+// last_ota_result enum 화이트리스트. 서버가 metric 차원으로 그대로 사용하므로
+// 새 값 추가 시 aws-infra와 동시 합의 필요. 빈 문자열/그 외 값은 절대 emit X.
+static constexpr const char* kOtaResultSuccess = "success";
+static constexpr const char* kOtaResultShaMismatch = "sha_mismatch";
+static constexpr const char* kOtaResultDownloadFailed = "download_failed";
+static constexpr const char* kOtaResultFlashFailed = "flash_failed";
+static constexpr const char* kOtaResultRolledBack = "rolled_back";
+static constexpr const char* kOtaResultVersionRejected = "version_rejected";
 
 }  // namespace protocol
 }  // namespace iconia

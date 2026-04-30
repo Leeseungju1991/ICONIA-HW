@@ -141,15 +141,36 @@ class IconiaApp {
   // OTA 클라이언트 (esp_https_ota 기반).
   // performOta: presigned URL 다운로드 → SHA-256 검증 → 듀얼 파티션 플래시.
   //             성공 반환 후 호출자는 ESP.restart() 해야 함.
-  // canEnterOta: 가드 사전 검사(배터리/RSSI/계약 헤더 형식). 미달 사유 로깅.
+  // canEnterOta: 가드 사전 검사(배터리/RSSI/계약 헤더 형식 + 다운그레이드).
+  //              미달 사유는 분류 로깅, 다운그레이드 거부는 NVS에 결과 기록.
   // sanitizeUrlForLog: presigned URL의 쿼리(서명) 마스킹.
-  // markAppValidIfPending: pending_verify 파티션이면 자가점검 통과 표시.
-  bool canEnterOta(const OtaCommand& ota, int batteryPercent, int rssiDbm) const;
+  // markAppValidIfPending: pending_verify 파티션이면 자가점검 통과 표시 +
+  //                        NVS에 success 결과 기록(다음 보고에 포함).
+  bool canEnterOta(const OtaCommand& ota, int batteryPercent, int rssiDbm);
   bool performOta(const OtaCommand& ota);
   String sanitizeUrlForLog(const String& url) const;
   void markAppValidIfPending();
   static bool hexStringIsLowerSha256(const String& s);
   static bool stringStartsWithHttps(const String& s);
+
+  // OTA 결과 보고 채널.
+  // recordOtaResult: NVS(ota_result/ota_attempt_ver) 페어로 결과 영속화.
+  //                  enum 화이트리스트와 semver 형식을 통과한 값만 저장.
+  //                  실패는 swallow(시리얼 경고만) — OTA 정상 흐름을 막지 않음.
+  // loadLastOtaReport: 다음 multipart에 첨부할 페어를 NVS에서 읽어옴.
+  //                    페어 정합성(둘 다 존재 + 형식 통과) 깨지면 erase + false.
+  // clearLastOtaReport: 응답 success 직후 호출하여 중복 emit 방지.
+  // detectRollbackOnBoot: 부팅 직후 ESP_OTA_IMG_INVALID 등으로 롤백 추론하여
+  //                       ota_result=rolled_back 기록(직전 attempt_ver 유지).
+  void recordOtaResult(const char* resultEnum, const char* attemptedVersion);
+  bool loadLastOtaReport(String& outResult, String& outVersion);
+  void clearLastOtaReport();
+  void detectRollbackOnBoot();
+  static bool isAllowedOtaResult(const char* resultEnum);
+  static bool isValidSemver(const char* version);
+  static bool parseSemver(const char* version, int& major, int& minor, int& patch);
+  static int compareSemver(int aMajor, int aMinor, int aPatch,
+                           int bMajor, int bMinor, int bPatch);
 
   // BLE secure-mode helpers (no-ops when kBleSecureMode is false)
   void generateProvisioningNonce();

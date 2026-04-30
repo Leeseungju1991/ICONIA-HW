@@ -149,6 +149,12 @@ void IconiaApp::begin() {
     return;
   }
 
+  // OTA 롤백 감지: 새 펌웨어가 자가점검 실패로 롤백되었거나, 현재 파티션이
+  // INVALID 상태로 부팅됐을 때 NVS에 ota_result=rolled_back 기록. NVS의
+  // ota_attempt_ver은 그대로 유지해야 직전 시도 버전을 서버가 알 수 있다.
+  // openPreferences보다 먼저 호출하지 않도록 NVS 오픈 후 시점에서 실행.
+  detectRollbackOnBoot();
+
   WifiCredentials creds = loadWifiCredentials();
   if (!creds.valid) {
     logLine("[BOOT] no Wi-Fi credentials, entering BLE provisioning");
@@ -810,12 +816,23 @@ IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payloa
   char batteryText[8];
   snprintf(batteryText, sizeof(batteryText), "%d", payload.batteryPercent);
 
+  // OTA 결과 페어 로드. 페어가 깨졌거나 없으면 둘 다 emit X (서버는 한쪽만
+  // 와도 무시). 보고할 게 있으면 hasOtaReport=true, 두 필드를 multipart에 추가.
+  String lastOtaResult;
+  String lastOtaAttemptedVersion;
+  bool hasOtaReport = loadLastOtaReport(lastOtaResult, lastOtaAttemptedVersion);
+
   size_t contentLength = 0;
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldTouch, payload.touch);
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldDeviceId, payload.deviceId);
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldBattery, batteryText);
   // firmware_version은 OTA 여부와 무관하게 항상 보고 (서버 측 롤아웃 추적용).
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldFirmwareVersion, iconia::config::kFirmwareVersion);
+  // last_ota_result/last_ota_attempted_version은 옵션 페어. 있을 때만 길이 가산.
+  if (hasOtaReport) {
+    contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldLastOtaResult, lastOtaResult.c_str());
+    contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldLastOtaAttemptedVersion, lastOtaAttemptedVersion.c_str());
+  }
   contentLength += multipartImageHeaderLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldImage, iconia::protocol::kImageFileName);
   contentLength += payload.imageLen;
   contentLength += strlen("\r\n--") + strlen(iconia::config::kMultipartBoundary) + strlen("--\r\n");
@@ -861,19 +878,44 @@ IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payloa
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldTouch, payload.touch) ||
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldDeviceId, payload.deviceId) ||
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldBattery, batteryText) ||
-      !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldFirmwareVersion, iconia::config::kFirmwareVersion) ||
-      !writeMultipartImageHeader(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldImage, iconia::protocol::kImageFileName) ||
+      !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldFirmwareVersion, iconia::config::kFirmwareVersion)) {
+    logLine("[ERROR] HTTPS request write failed (base fields)");
+    client.stop();
+    return result;
+  }
+
+  // 옵션 페어. 기존 5개 뒤, image 앞에 추가 — 서버 multipart 파서 입장에서
+  // 순서는 무관하지만 운영 일관성 위해 합의된 위치 유지.
+  if (hasOtaReport) {
+    if (!writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldLastOtaResult, lastOtaResult.c_str()) ||
+        !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldLastOtaAttemptedVersion, lastOtaAttemptedVersion.c_str())) {
+      logLine("[ERROR] HTTPS request write failed (ota report fields)");
+      client.stop();
+      return result;
+    }
+  }
+
+  if (!writeMultipartImageHeader(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldImage, iconia::protocol::kImageFileName) ||
       !writeAll(client, payload.imageData, payload.imageLen) ||
       !writeAll(client, reinterpret_cast<const uint8_t*>("\r\n--"), 4) ||
       !writeAll(client, reinterpret_cast<const uint8_t*>(iconia::config::kMultipartBoundary), strlen(iconia::config::kMultipartBoundary)) ||
       !writeAll(client, reinterpret_cast<const uint8_t*>("--\r\n"), 4)) {
-    logLine("[ERROR] HTTPS request write failed");
+    logLine("[ERROR] HTTPS request write failed (image)");
     client.stop();
     return result;
   }
 
   result = readHttpResponseAndCommand(client);
   client.stop();
+
+  // 응답 success를 받은 직후 NVS의 페어를 삭제 — 한 번만 보고하면 충분 (중복
+  // emit 방지). 응답 실패 시 NVS 유지 → 다음 wake에서 자동 재시도.
+  // hasOtaReport가 true였다는 것은 이번 multipart에 페어를 실제로 emit했다는
+  // 뜻이므로, success일 때만 삭제하면 안전.
+  if (result.success && hasOtaReport) {
+    clearLastOtaReport();
+    logLine("[OTA-REPORT] emitted and cleared");
+  }
   return result;
 }
 
@@ -1196,12 +1238,16 @@ String IconiaApp::sanitizeUrlForLog(const String& url) const {
 }
 
 // OTA 진입 가드. 모두 만족할 때만 true.
-// - OtaCommand 형식 검증 (https URL, 64자 소문자 hex sha256, version 비어있지 않음)
+// - OtaCommand 형식 검증 (https URL, 64자 소문자 hex sha256, version semver)
+// - **다운그레이드 가드**: ota.version이 현재 kFirmwareVersion보다 strictly 커야
+//   함. 작거나 같으면 거부 + NVS에 version_rejected 기록 (서버 manifest 손상
+//   시 펌웨어가 마지막 방어선 역할). 최후의 보루이므로 형식 비정상도 거부.
 // - 배터리 >= kBatteryOtaMinPercent
 // - RSSI > kRssiOtaMinDbm
 // - kS3RootCaPem 비어 있고 kAllowInsecureOtaWhenRootCaMissing도 false면 거부
 // 미달 사유는 분류 로깅하여 운영 시 디버깅 가능.
-bool IconiaApp::canEnterOta(const OtaCommand& ota, int batteryPercent, int rssiDbm) const {
+// const 제거 이유: 다운그레이드 거부 시 NVS write가 필요해 preferences_를 수정.
+bool IconiaApp::canEnterOta(const OtaCommand& ota, int batteryPercent, int rssiDbm) {
   if (!ota.present) {
     logLine("[OTA-GUARD] no OTA headers");
     return false;
@@ -1218,6 +1264,31 @@ bool IconiaApp::canEnterOta(const OtaCommand& ota, int batteryPercent, int rssiD
     logLine("[OTA-GUARD] version missing");
     return false;
   }
+
+  // 다운그레이드 가드. 양쪽 모두 strict semver(major.minor.patch)여야 비교 의미
+  // 있음. 한쪽이라도 형식 비정상이면 보수적으로 거부 + version_rejected 기록.
+  int curMaj = 0, curMin = 0, curPat = 0;
+  int newMaj = 0, newMin = 0, newPat = 0;
+  if (!parseSemver(iconia::config::kFirmwareVersion, curMaj, curMin, curPat)) {
+    logLine(String("[OTA-GUARD] current firmware version not strict semver: ") +
+            iconia::config::kFirmwareVersion);
+    recordOtaResult(iconia::protocol::kOtaResultVersionRejected, ota.version.c_str());
+    return false;
+  }
+  if (!parseSemver(ota.version.c_str(), newMaj, newMin, newPat)) {
+    logLine(String("[OTA-GUARD] incoming version not strict semver: ") + ota.version);
+    // attempt_ver에 garbage 저장 안 함 — isValidSemver 통과 못 하면 record는 erase.
+    recordOtaResult(iconia::protocol::kOtaResultVersionRejected, ota.version.c_str());
+    return false;
+  }
+  int cmp = compareSemver(newMaj, newMin, newPat, curMaj, curMin, curPat);
+  if (cmp <= 0) {
+    logLine(String("[OTA-GUARD] version_downgrade_blocked: current=") +
+            iconia::config::kFirmwareVersion + " incoming=" + ota.version);
+    recordOtaResult(iconia::protocol::kOtaResultVersionRejected, ota.version.c_str());
+    return false;
+  }
+
   if (batteryPercent < iconia::config::kBatteryOtaMinPercent) {
     logLine(String("[OTA-GUARD] battery ") + batteryPercent + "% < " +
             iconia::config::kBatteryOtaMinPercent + "%");
@@ -1239,10 +1310,23 @@ bool IconiaApp::canEnterOta(const OtaCommand& ota, int batteryPercent, int rssiD
 // OTA 다운로드 + 검증 + 플래시. 성공 시 true (호출자가 ESP.restart() 책임).
 // SHA-256 검증은 다운로드 완료 후 update 파티션을 mmap하여 한 번에 계산.
 // 불일치하면 esp_https_ota_abort()로 부분 기록 폐기.
+// 각 단계의 실패는 NVS에 결과 enum으로 기록 — 다음 wake의 multipart에 첨부되어
+// 서버가 OTA 무한 실패 루프(배터리 소진 위험)를 탐지할 수 있게 한다.
+// 진입 직전 attempt_ver을 NVS에 기록 — 다운로드/플래시 도중 power loss로
+// 결과가 기록되지 않더라도 "이 버전을 시도했다"는 사실은 남는다.
 bool IconiaApp::performOta(const OtaCommand& ota) {
   logLine(String("[OTA] start version=") + ota.version +
           " size=" + String((long)ota.sizeBytes) +
           " url=" + sanitizeUrlForLog(ota.url));
+
+  // 시도 사실 선기록: 결과는 미정이지만 attempt_ver만 저장. 아래 단계에서 실제
+  // 결과로 덮어쓰며, 덮어쓰기 전 power loss 시 부팅 후 detectRollbackOnBoot가
+  // attempt_ver을 그대로 활용한다. semver는 canEnterOta에서 이미 검증됨.
+  // (recordOtaResult는 페어로만 쓸 수 있으므로 임시 placeholder 결과를 쓰지
+  // 않고, 직접 NVS putString으로 attempt_ver만 갱신한다.)
+  if (preferences_.putString("ota_attempt_ver", ota.version.c_str()) == 0) {
+    logLine("[OTA-REPORT] NVS attempt_ver write failed (swallowed)");
+  }
 
   // Watchdog 임시 연장 → 다운로드 완료/abort 후 default로 복귀.
   // ESP-IDF 5.x esp_task_wdt_config_t는 POD이므로 두 인스턴스를 미리 만들어둔다.
@@ -1278,6 +1362,7 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
   esp_err_t err = esp_https_ota_begin(&otaConfig, &handle);
   if (err != ESP_OK || handle == nullptr) {
     logLine(String("[OTA] begin failed err=") + (int)err);
+    recordOtaResult(iconia::protocol::kOtaResultDownloadFailed, ota.version.c_str());
     esp_task_wdt_reconfigure(&wdtDefault);
     return false;
   }
@@ -1289,6 +1374,8 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
     logLine(String("[OTA] size mismatch reported=") + reportedSize +
             " expected=" + String((long)ota.sizeBytes));
     esp_https_ota_abort(handle);
+    // 사이즈 mismatch는 본질적으로 manifest/object 손상 → download 카테고리로 분류.
+    recordOtaResult(iconia::protocol::kOtaResultDownloadFailed, ota.version.c_str());
     esp_task_wdt_reconfigure(&wdtDefault);
     return false;
   }
@@ -1305,6 +1392,7 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
   if (err != ESP_OK) {
     logLine(String("[OTA] perform failed err=") + (int)err);
     esp_https_ota_abort(handle);
+    recordOtaResult(iconia::protocol::kOtaResultDownloadFailed, ota.version.c_str());
     esp_task_wdt_reconfigure(&wdtDefault);
     return false;
   }
@@ -1312,6 +1400,7 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
   if (!esp_https_ota_is_complete_data_received(handle)) {
     logLine("[OTA] incomplete data");
     esp_https_ota_abort(handle);
+    recordOtaResult(iconia::protocol::kOtaResultDownloadFailed, ota.version.c_str());
     esp_task_wdt_reconfigure(&wdtDefault);
     return false;
   }
@@ -1325,6 +1414,8 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
   if (updatePart == nullptr) {
     logLine("[OTA] no update partition");
     esp_https_ota_abort(handle);
+    // 파티션 부재는 flash 인프라 문제 → flash 카테고리.
+    recordOtaResult(iconia::protocol::kOtaResultFlashFailed, ota.version.c_str());
     esp_task_wdt_reconfigure(&wdtDefault);
     return false;
   }
@@ -1335,6 +1426,7 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
                          &mappedPtr, &mapHandle) != ESP_OK) {
     logLine("[OTA] mmap failed for sha256 verify");
     esp_https_ota_abort(handle);
+    recordOtaResult(iconia::protocol::kOtaResultFlashFailed, ota.version.c_str());
     esp_task_wdt_reconfigure(&wdtDefault);
     return false;
   }
@@ -1358,6 +1450,7 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
     logLine(String("[OTA] sha256 mismatch expected=") + ota.sha256 +
             " got=" + String(hexDigest));
     esp_https_ota_abort(handle);
+    recordOtaResult(iconia::protocol::kOtaResultShaMismatch, ota.version.c_str());
     esp_task_wdt_reconfigure(&wdtDefault);
     return false;
   }
@@ -1369,14 +1462,22 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
 
   if (err != ESP_OK) {
     logLine(String("[OTA] finish failed err=") + (int)err);
+    // finish 실패는 partition flash 단계 — boot count/state 기록 실패 포함.
+    recordOtaResult(iconia::protocol::kOtaResultFlashFailed, ota.version.c_str());
     return false;
   }
+  // 성공 시 결과 기록은 markAppValidIfPending에서 (자가점검 통과 후). 여기서는
+  // attempt_ver만 살아 있으면 충분 — 새 펌웨어 부팅 후 첫 업로드에서 success
+  // 페어를 emit하거나, 자가점검 실패 시 detectRollbackOnBoot가 rolled_back으로 덮어씀.
   return true;
 }
 
 // 새 펌웨어 부팅 직후의 자가점검 통과 처리.
 // ota_state가 ESP_OTA_IMG_PENDING_VERIFY인 경우만 mark_valid_cancel_rollback.
 // 그 외(이미 valid거나 부팅 안 됨 등)는 no-op. 호출은 첫 정상 업로드 성공 후.
+// 자가점검 통과 시 NVS에 success 결과를 기록(직전 attempt_ver 자리에 현재
+// 부팅된 새 버전 = kFirmwareVersion 저장). 다음 multipart 보고에서 서버는
+// "X 버전이 부팅 + 자가점검 + 첫 업로드까지 성공"이라는 명확한 신호 획득.
 void IconiaApp::markAppValidIfPending() {
   const esp_partition_t* running = esp_ota_get_running_partition();
   if (running == nullptr) {
@@ -1392,7 +1493,208 @@ void IconiaApp::markAppValidIfPending() {
   esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
   if (err == ESP_OK) {
     logLine("[OTA] self-test passed, marked app valid (rollback cancelled)");
+    // 성공 신호 기록. 현재 부팅된 버전(kFirmwareVersion)을 attempt_ver 자리에
+    // 넣어 "이 버전이 정상 부팅 + 자가점검 통과"라는 의미로 서버에 emit.
+    recordOtaResult(iconia::protocol::kOtaResultSuccess,
+                    iconia::config::kFirmwareVersion);
   } else {
     logLine(String("[OTA] mark_valid failed err=") + (int)err);
   }
+}
+
+// -----------------------------------------------------------------------------
+// OTA 결과 보고 채널 (다운그레이드 가드 + 결과 영속화)
+// -----------------------------------------------------------------------------
+
+// "major.minor.patch" 형식만 허용. prerelease/build 메타("1.2.3-rc1",
+// "1.2.3+sha")는 보수적으로 거부 — 서버가 manifest 손상 시 garbage 버전을
+// 보냈을 때 다운그레이드 가드가 무력화되는 것을 막는다.
+bool IconiaApp::parseSemver(const char* version, int& major, int& minor, int& patch) {
+  if (version == nullptr || version[0] == '\0') {
+    return false;
+  }
+  major = -1;
+  minor = -1;
+  patch = -1;
+
+  int parts[3] = {-1, -1, -1};
+  int idx = 0;
+  int current = -1;
+  for (const char* p = version; ; ++p) {
+    char c = *p;
+    if (c >= '0' && c <= '9') {
+      if (current < 0) {
+        current = 0;
+      }
+      // overflow 보호: 5자리 넘는 component는 거부(현실적으로 99999 충분).
+      if (current > 9999) {
+        return false;
+      }
+      current = current * 10 + (c - '0');
+    } else if (c == '.' || c == '\0') {
+      if (current < 0) {
+        return false;  // 비어 있는 component
+      }
+      if (idx >= 3) {
+        return false;  // 4번째 component 거부
+      }
+      parts[idx++] = current;
+      current = -1;
+      if (c == '\0') {
+        break;
+      }
+    } else {
+      // prerelease 태그('-'), build 메타('+'), 공백 등 일체 거부.
+      return false;
+    }
+  }
+
+  if (idx != 3) {
+    return false;
+  }
+  major = parts[0];
+  minor = parts[1];
+  patch = parts[2];
+  return true;
+}
+
+// -1: a < b, 0: a == b, 1: a > b
+int IconiaApp::compareSemver(int aMajor, int aMinor, int aPatch,
+                             int bMajor, int bMinor, int bPatch) {
+  if (aMajor != bMajor) return aMajor < bMajor ? -1 : 1;
+  if (aMinor != bMinor) return aMinor < bMinor ? -1 : 1;
+  if (aPatch != bPatch) return aPatch < bPatch ? -1 : 1;
+  return 0;
+}
+
+bool IconiaApp::isValidSemver(const char* version) {
+  int major = 0, minor = 0, patch = 0;
+  return parseSemver(version, major, minor, patch);
+}
+
+bool IconiaApp::isAllowedOtaResult(const char* resultEnum) {
+  if (resultEnum == nullptr) {
+    return false;
+  }
+  return strcmp(resultEnum, iconia::protocol::kOtaResultSuccess) == 0 ||
+         strcmp(resultEnum, iconia::protocol::kOtaResultShaMismatch) == 0 ||
+         strcmp(resultEnum, iconia::protocol::kOtaResultDownloadFailed) == 0 ||
+         strcmp(resultEnum, iconia::protocol::kOtaResultFlashFailed) == 0 ||
+         strcmp(resultEnum, iconia::protocol::kOtaResultRolledBack) == 0 ||
+         strcmp(resultEnum, iconia::protocol::kOtaResultVersionRejected) == 0;
+}
+
+// NVS 페어 기록. enum 화이트리스트 / semver 형식을 통과한 값만 저장.
+// 어느 쪽이라도 검증 실패면 둘 다 erase하고 swallow + 시리얼 경고
+// (NVS 손상으로 garbage 보내는 것보다 보고 생략이 안전).
+// NVS write 실패도 swallow — OTA 정상 흐름을 막지 않음.
+void IconiaApp::recordOtaResult(const char* resultEnum, const char* attemptedVersion) {
+  if (!isAllowedOtaResult(resultEnum)) {
+    logLine(String("[OTA-REPORT] reject result enum: ") +
+            (resultEnum ? resultEnum : "<null>"));
+    clearLastOtaReport();
+    return;
+  }
+  if (attemptedVersion == nullptr || !isValidSemver(attemptedVersion)) {
+    logLine(String("[OTA-REPORT] reject version: ") +
+            (attemptedVersion ? attemptedVersion : "<null>"));
+    clearLastOtaReport();
+    return;
+  }
+
+  size_t r = preferences_.putString("ota_result", resultEnum);
+  size_t v = preferences_.putString("ota_attempt_ver", attemptedVersion);
+  if (r == 0 || v == 0) {
+    logLine("[OTA-REPORT] NVS write failed (swallowed)");
+    return;
+  }
+  logLine(String("[OTA-REPORT] recorded result=") + resultEnum +
+          " ver=" + attemptedVersion);
+}
+
+// 페어를 NVS에서 읽어옴. 둘 다 존재 + 형식 통과해야 true (= multipart emit 가능).
+// 페어 정합성이 깨졌거나 형식 불량이면 둘 다 erase하고 false (보고 생략).
+//
+// 단, "ota_result는 비었지만 ota_attempt_ver은 유효한" 일시적 상태는 정상으로
+// 인식하여 erase 하지 않는다. 이 상태는 performOta가 attempt_ver을 선기록한
+// 직후 power loss가 났거나, 아직 markAppValidIfPending이 호출되기 전 첫 보고
+// 사이클 등에서 발생한다 — detectRollbackOnBoot가 이 attempt_ver을 활용하여
+// rolled_back을 emit해야 하므로 보존이 필수.
+bool IconiaApp::loadLastOtaReport(String& outResult, String& outVersion) {
+  outResult = preferences_.getString("ota_result", "");
+  outVersion = preferences_.getString("ota_attempt_ver", "");
+
+  if (outResult.length() == 0 && outVersion.length() == 0) {
+    return false;  // 정상 케이스: 보고할 게 없음
+  }
+  if (outResult.length() == 0 && outVersion.length() > 0) {
+    // 시도 선기록 상태(아직 결과 미확정). emit은 안 하되 NVS는 보존.
+    return false;
+  }
+  if (outResult.length() > 0 && outVersion.length() == 0) {
+    logLine("[OTA-REPORT] NVS pair broken (result without version), erasing");
+    clearLastOtaReport();
+    return false;
+  }
+  if (!isAllowedOtaResult(outResult.c_str()) ||
+      !isValidSemver(outVersion.c_str())) {
+    logLine("[OTA-REPORT] NVS pair invalid format, erasing");
+    clearLastOtaReport();
+    return false;
+  }
+  return true;
+}
+
+// 응답 success 직후 호출. 페어를 모두 erase하여 단일 보고 보장.
+void IconiaApp::clearLastOtaReport() {
+  preferences_.remove("ota_result");
+  preferences_.remove("ota_attempt_ver");
+}
+
+// 부팅 직후 롤백 감지. 다음 두 케이스에서 ota_result=rolled_back 기록:
+//   1) 현재 running 파티션 상태가 ESP_OTA_IMG_INVALID — 새 펌웨어가 자가점검
+//      실패로 부트로더에 의해 이전 슬롯으로 강제 복귀됐음
+//   2) running과 boot 파티션이 서로 다른 OTA 슬롯이고, last_invalid 파티션이
+//      존재 — 자가점검 실패한 슬롯 추적이 가능한 케이스
+// attempt_ver은 NVS에 남아있는 직전 시도 값을 그대로 유지해야 서버가 어떤
+// 버전이 죽었는지 안다(여기서 새로 쓰지 않음).
+void IconiaApp::detectRollbackOnBoot() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (running == nullptr) {
+    return;
+  }
+
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (esp_ota_get_state_partition(running, &state) != ESP_OK) {
+    return;
+  }
+
+  bool rolledBack = false;
+  if (state == ESP_OTA_IMG_INVALID || state == ESP_OTA_IMG_ABORTED) {
+    rolledBack = true;
+    logLine("[OTA-ROLLBACK] running partition state INVALID/ABORTED");
+  } else {
+    // 부트로더가 last_invalid_partition을 노출하면 이전 사이클의 실패 추론.
+    const esp_partition_t* lastInvalid = esp_ota_get_last_invalid_partition();
+    if (lastInvalid != nullptr && lastInvalid != running) {
+      rolledBack = true;
+      logLine("[OTA-ROLLBACK] last_invalid partition present, rollback inferred");
+    }
+  }
+
+  if (!rolledBack) {
+    return;
+  }
+
+  // attempt_ver은 NVS의 직전 값 유지. 결과만 rolled_back으로 덮어쓴다.
+  // performOta가 시도 선기록한 attempt_ver만 살아있는 케이스(loadLastOtaReport
+  // 가 false 반환)도 직접 NVS에서 읽어 활용해야 한다.
+  String prevVersion = preferences_.getString("ota_attempt_ver", "");
+  if (prevVersion.length() == 0 || !isValidSemver(prevVersion.c_str())) {
+    // 직전 attempt_ver을 잃어버렸거나 garbage — 어떤 버전이 죽었는지 모름.
+    // 서버가 garbage 받지 않도록 보고 생략.
+    logLine("[OTA-ROLLBACK] no usable prior attempt_ver, skip emit");
+    return;
+  }
+  recordOtaResult(iconia::protocol::kOtaResultRolledBack, prevVersion.c_str());
 }
