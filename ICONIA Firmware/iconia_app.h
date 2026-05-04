@@ -71,6 +71,9 @@ class IconiaApp {
     int batteryPercent;
     const uint8_t* imageData;
     size_t imageLen;
+    // 멱등성 키. uploadEventWithRetry에서 1회 생성 → 모든 재시도에서 동일 값 유지.
+    // 형식: "<MAC12hex>-<wakeMs>-<rand4hex>". null-terminator 포함 32자 buffer면 충분.
+    char eventId[40];
   };
 
   struct UploadResult {
@@ -107,13 +110,29 @@ class IconiaApp {
   void enterDeepSleep();
 
   void buildDeviceId(char* outBuffer, size_t outBufferLen) const;
+  // event_id 생성 — wake당 1회 호출. deviceId(콜론 제거)와 millis(), 32-bit
+  // hardware random 4바이트(=8 hex chars 중 상위 4 hex)를 조합해 충돌 가능성을
+  // 통계적으로 무시할 수 있는 수준으로 낮춤.
+  void buildEventId(const char* deviceId, char* outBuffer, size_t outBufferLen) const;
   String bleDeviceName() const;
   static const char* touchToString(TouchDirection direction);
 
   ParsedUrl parseHttpsUrl(const char* url) const;
-  bool connectToWifi(const WifiCredentials& creds);
+  // connectToWifi: outAuthFailed로 인증 실패(WL_CONNECT_FAILED) 분리 신호.
+  // - true 반환: 연결 성공. outAuthFailed는 false.
+  // - false 반환: 연결 실패. outAuthFailed가 true면 비밀번호 잘못 가능성.
+  //   false면 일시적 장애(NO_SSID, timeout 등). 호출자가 NVS 카운터 정책을 결정.
+  bool connectToWifi(const WifiCredentials& creds, bool* outAuthFailed = nullptr);
+  // connectToWifiWithRetry: 모든 attempt가 WL_CONNECT_FAILED인 경우만 NVS 영속
+  // 카운터를 증가. 성공 시 카운터 0 reset. 임계치(kWifiAuthFailEraseThreshold)
+  // 도달 시 wifi 자격증명 erase + 다음 부팅 BLE provisioning 자동 진입.
   bool connectToWifiWithRetry(const WifiCredentials& creds, uint8_t retryCount);
   bool configureSecureClient(WiFiClientSecure& client);
+
+  // Wi-Fi 인증 실패 카운터 도우미. NVS key: "wifi_fail_cnt".
+  uint32_t loadWifiAuthFailCount();
+  void saveWifiAuthFailCount(uint32_t count);
+  void resetWifiAuthFailCount();
 
   static bool writeAll(WiFiClient& client, const uint8_t* data, size_t len);
   static bool readLine(WiFiClientSecure& client, char* buffer, size_t bufferSize);

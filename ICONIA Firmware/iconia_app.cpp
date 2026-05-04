@@ -140,6 +140,18 @@ void IconiaApp::begin() {
   pinMode(iconia::config::kTouchRightGpio, INPUT);
   pinMode(iconia::config::kTouchLeftGpio, INPUT);
 
+  // PSRAM 필수 가드. ICONIA HW 명세상 ESP32-CAM(AI Thinker, 4MB PSRAM 탑재)이
+  // 표준 모듈. PSRAM 미감지는 잘못된 부품 또는 솔더링 문제 — JPEG VGA 프레임 버퍼
+  // (수십 KB ~ 200KB+)를 shared SRAM에 두면 Wi-Fi/TLS 스택과 경합하여 OOM 위험.
+  // 폴백 운용을 막고 즉시 fatal halt 후 deep sleep — 다음 wake 시도하지 않도록
+  // EXT1 wakeup도 disable.
+  if (!psramFound()) {
+    logLine("[FATAL] PSRAM not found; halting (ICONIA requires 4MB PSRAM module)");
+    delay(500);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_deep_sleep_start();
+  }
+
   initBatteryMonitor();
 
   if (!openPreferences()) {
@@ -370,10 +382,15 @@ camera_config_t IconiaApp::buildCameraConfig() {
   config.pin_reset = iconia::config::kResetGpio;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = psramFound() ? iconia::config::kCaptureFrameSize : FRAMESIZE_VGA;
-  config.jpeg_quality = psramFound() ? iconia::config::kCaptureJpegQuality : 14;
+  // PSRAM은 setup 단계 fatal guard로 보장됨 — 분기 제거.
+  config.frame_size = iconia::config::kCaptureFrameSize;
+  config.jpeg_quality = iconia::config::kCaptureJpegQuality;
   config.fb_count = 1;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  // ICONIA hardware ships with PSRAM (AI Thinker ESP32-CAM 4MB). VGA JPEG 캡처
+  // 시 frame buffer가 SRAM(~520KB shared)을 압박하지 않도록 PSRAM에 위치시킨다.
+  // PSRAM 부재는 setup() 단계의 fatal guard(psramFound 체크)에서 이미 걸러진다.
+  config.fb_location = CAMERA_FB_IN_PSRAM;
   return config;
 }
 
@@ -384,7 +401,8 @@ bool IconiaApp::initCamera() {
   pinMode(iconia::config::kCameraPowerDownGpio, OUTPUT);
   digitalWrite(iconia::config::kCameraPowerDownGpio, LOW);
   // OV2640 needs >= ~10 ms after PWDN goes low before SCCB is reachable.
-  delay(50);
+  // 데이터시트 최소값(~10ms) + 마진. 실측 후 안전 하한 20ms로 단축.
+  delay(20);
 
   camera_config_t config = buildCameraConfig();
   if (esp_camera_init(&config) != ESP_OK) {
@@ -399,7 +417,8 @@ bool IconiaApp::initCamera() {
     sensor->set_saturation(sensor, 0);
   }
 
-  delay(300);
+  // sensor 설정 반영 대기. 워밍업 프레임이 별도로 한 장 폐기되므로 100ms로 단축.
+  delay(100);
   return true;
 }
 
@@ -413,10 +432,17 @@ camera_fb_t* IconiaApp::captureImage() {
     return nullptr;
   }
 
+  // 워밍업 프레임: AGC/AWB 수렴 안정화 목적. 폐기 정책은 측정 데이터 없이
+  // 제거하기 위험하므로 유지. TODO: AGC/AWB 수렴이 첫 프레임에서 5% 이내 오차로
+  // 끝난다는 측정 데이터 확보 시 본 폐기 로직 제거(약 +120ms 절감 가능).
+  unsigned long warmupStartMs = millis();
   camera_fb_t* warmupFrame = esp_camera_fb_get();
   if (warmupFrame != nullptr) {
+    size_t warmupLen = warmupFrame->len;
     esp_camera_fb_return(warmupFrame);
     delay(100);
+    logLine(String("[CAM] warmup frame discarded len=") + warmupLen +
+            " elapsed=" + (millis() - warmupStartMs) + "ms");
   }
 
   camera_fb_t* frame = esp_camera_fb_get();
@@ -508,6 +534,30 @@ void IconiaApp::buildDeviceId(char* outBuffer, size_t outBufferLen) const {
   );
 }
 
+void IconiaApp::buildEventId(const char* deviceId, char* outBuffer, size_t outBufferLen) const {
+  if (outBuffer == nullptr || outBufferLen == 0) {
+    return;
+  }
+  // deviceId의 콜론 제거 → 12 hex chars. 입력 길이가 다른 경우에도 안전하게.
+  char macCompact[16] = {0};
+  size_t mi = 0;
+  if (deviceId != nullptr) {
+    for (size_t i = 0; deviceId[i] != '\0' && mi + 1 < sizeof(macCompact); ++i) {
+      if (deviceId[i] != ':') {
+        macCompact[mi++] = deviceId[i];
+      }
+    }
+  }
+  macCompact[mi] = '\0';
+
+  uint32_t wakeMs = (uint32_t)millis();
+  uint32_t rand32 = esp_random();
+  uint16_t rand16 = (uint16_t)(rand32 & 0xFFFFu);
+
+  snprintf(outBuffer, outBufferLen, "%s-%lu-%04x",
+           macCompact, (unsigned long)wakeMs, rand16);
+}
+
 String IconiaApp::bleDeviceName() const {
   char deviceId[18];
   buildDeviceId(deviceId, sizeof(deviceId));
@@ -553,7 +603,11 @@ IconiaApp::ParsedUrl IconiaApp::parseHttpsUrl(const char* url) const {
   return parsed;
 }
 
-bool IconiaApp::connectToWifi(const WifiCredentials& creds) {
+bool IconiaApp::connectToWifi(const WifiCredentials& creds, bool* outAuthFailed) {
+  if (outAuthFailed != nullptr) {
+    *outAuthFailed = false;
+  }
+
   // Full clock for the (short) connect+TLS phase. Reverted in enterDeepSleep().
   setCpuFrequencyMhz(iconia::config::kCpuFrequencyActiveMhz);
 
@@ -563,32 +617,98 @@ bool IconiaApp::connectToWifi(const WifiCredentials& creds) {
   WiFi.setSleep(WIFI_PS_MAX_MODEM);
   WiFi.begin(creds.ssid.c_str(), creds.password.c_str());
 
+  // 폴링 간격 50 ms — kWifiConnectTimeoutMs(15s)를 충분히 자주 sample하여
+  // WL_CONNECT_FAILED를 timeout 만료보다 일찍 포착. WDT(default 30s) 영향 없음.
   unsigned long startMs = millis();
-  while (WiFi.status() != WL_CONNECTED &&
-         (millis() - startMs) < iconia::config::kWifiConnectTimeoutMs) {
-    delay(250);
+  wl_status_t lastStatus = WL_IDLE_STATUS;
+  while ((millis() - startMs) < iconia::config::kWifiConnectTimeoutMs) {
+    lastStatus = WiFi.status();
+    if (lastStatus == WL_CONNECTED) {
+      break;
+    }
+    if (lastStatus == WL_CONNECT_FAILED) {
+      // 라우터가 명시적으로 인증 거부. timeout까지 기다릴 필요 없이 즉시 실패.
+      break;
+    }
+    delay(50);
     esp_task_wdt_reset();
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
+  wl_status_t finalStatus = WiFi.status();
+  if (finalStatus == WL_CONNECTED) {
     logLine("[WIFI] connected: " + WiFi.localIP().toString());
     return true;
   }
 
+  if (finalStatus == WL_CONNECT_FAILED) {
+    if (outAuthFailed != nullptr) {
+      *outAuthFailed = true;
+    }
+    logLine("[WIFI] connection failed (auth_failed)");
+  } else {
+    // NO_SSID_AVAIL, IDLE, DISCONNECTED 또는 timeout 후 미정 상태
+    logLine(String("[WIFI] connection failed (status=") + (int)finalStatus + ")");
+  }
+
   WiFi.disconnect(true, true);
-  logLine("[WIFI] connection failed");
   return false;
 }
 
 bool IconiaApp::connectToWifiWithRetry(const WifiCredentials& creds, uint8_t retryCount) {
+  // 이번 wake에서 모든 attempt가 WL_CONNECT_FAILED였는지 추적. 한 번이라도
+  // 다른 실패 사유(timeout/NO_SSID)가 섞이면 일시적 장애로 간주, 카운터 미증가.
+  bool allAuthFailed = (retryCount > 0);
+
   for (uint8_t attempt = 1; attempt <= retryCount; ++attempt) {
     logLine("[WIFI] connect attempt " + String(attempt) + "/" + String(retryCount));
-    if (connectToWifi(creds)) {
+    bool authFailed = false;
+    if (connectToWifi(creds, &authFailed)) {
+      // 어떤 사유로든 한 번 성공 → 누적 카운터 reset.
+      if (loadWifiAuthFailCount() > 0) {
+        logLine("[WIFI] auth_fail counter reset on success");
+        resetWifiAuthFailCount();
+      }
       return true;
+    }
+    if (!authFailed) {
+      allAuthFailed = false;
     }
     delay(800);
   }
+
+  if (!allAuthFailed) {
+    return false;
+  }
+
+  // 모든 attempt가 인증 실패 → 영속 카운터 증가. 임계치 도달 시 자격증명 erase.
+  uint32_t cnt = loadWifiAuthFailCount() + 1;
+  saveWifiAuthFailCount(cnt);
+  if (cnt >= iconia::config::kWifiAuthFailEraseThreshold) {
+    logLine(String("[WIFI] auth_fail count=") + cnt + " >= threshold(" +
+            iconia::config::kWifiAuthFailEraseThreshold +
+            "), erasing creds and forcing BLE provisioning on next boot");
+    clearWifiCredentials();
+    resetWifiAuthFailCount();
+  } else {
+    logLine(String("[WIFI] auth_fail count=") + cnt + "/" +
+            iconia::config::kWifiAuthFailEraseThreshold);
+    if (cnt + 1 >= iconia::config::kWifiAuthFailEraseThreshold) {
+      logLine("[WIFI] credentials likely wrong, will erase on next failure");
+    }
+  }
   return false;
+}
+
+uint32_t IconiaApp::loadWifiAuthFailCount() {
+  return preferences_.getUInt("wifi_fail_cnt", 0);
+}
+
+void IconiaApp::saveWifiAuthFailCount(uint32_t count) {
+  preferences_.putUInt("wifi_fail_cnt", count);
+}
+
+void IconiaApp::resetWifiAuthFailCount() {
+  preferences_.remove("wifi_fail_cnt");
 }
 
 bool IconiaApp::configureSecureClient(WiFiClientSecure& client) {
@@ -826,6 +946,8 @@ IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payloa
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldTouch, payload.touch);
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldDeviceId, payload.deviceId);
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldBattery, batteryText);
+  // event_id: 재시도 시에도 동일 값 유지 → 서버 dedup용.
+  contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldEventId, payload.eventId);
   // firmware_version은 OTA 여부와 무관하게 항상 보고 (서버 측 롤아웃 추적용).
   contentLength += multipartTextFieldLength(iconia::config::kMultipartBoundary, iconia::protocol::kFieldFirmwareVersion, iconia::config::kFirmwareVersion);
   // last_ota_result/last_ota_attempted_version은 옵션 페어. 있을 때만 길이 가산.
@@ -854,7 +976,9 @@ IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payloa
     return result;
   }
 
-  char headers[384];
+  // 헤더 버퍼 512: User-Agent + X-API-Key(32+자) + Content-Length + Host 등
+  // 누적이 384에 근접하므로 안전 마진 확보 (M-M3 권고).
+  char headers[512];
   int headerLen = snprintf(
     headers,
     sizeof(headers),
@@ -878,6 +1002,7 @@ IconiaApp::UploadResult IconiaApp::postEventMultipart(const EventPayload& payloa
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldTouch, payload.touch) ||
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldDeviceId, payload.deviceId) ||
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldBattery, batteryText) ||
+      !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldEventId, payload.eventId) ||
       !writeMultipartTextField(client, iconia::config::kMultipartBoundary, iconia::protocol::kFieldFirmwareVersion, iconia::config::kFirmwareVersion)) {
     logLine("[ERROR] HTTPS request write failed (base fields)");
     client.stop();
@@ -1147,6 +1272,9 @@ IconiaApp::NextAction IconiaApp::runEventFlow(const WifiCredentials& creds) {
   payload.batteryPercent = battery.percent;
   payload.imageData = frame->buf;
   payload.imageLen = frame->len;
+  // 멱등성: wake당 1회만 생성 → 재시도 동안 보존. 서버 측 dedup 합의는 별도 작업.
+  buildEventId(payload.deviceId, payload.eventId, sizeof(payload.eventId));
+  logLine(String("[EVENT] event_id=") + payload.eventId);
 
   // OTA 자가점검 신호로 사용할 RSSI 캡처(이 시점은 Wi-Fi 연결 직후이며, OTA
   // 진입 가드의 입력값으로도 재사용된다).

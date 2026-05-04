@@ -20,6 +20,10 @@ static constexpr const char* kFieldTouch = "touch";
 static constexpr const char* kFieldDeviceId = "device_id";
 static constexpr const char* kFieldBattery = "battery";
 static constexpr const char* kFieldImage = "image";
+// 멱등성 키. 동일 wake에서 재시도 시 같은 값을 유지하여 서버 측 dedup이 가능
+// 하도록 함. 형식: "<deviceMacNoColons>-<wakeMs>-<rand4hex>" (총 ~26자).
+// 서버 합의는 별도 작업 — 본 펌웨어는 매 요청에 항상 emit.
+static constexpr const char* kFieldEventId = "event_id";
 // 모든 /api/event 요청에 항상 포함되는 펌웨어 자기보고 필드.
 static constexpr const char* kFieldFirmwareVersion = "firmware_version";
 // 직전 OTA 시도 결과 보고 필드(옵션 페어). 보고할 결과가 없으면 두 필드 모두

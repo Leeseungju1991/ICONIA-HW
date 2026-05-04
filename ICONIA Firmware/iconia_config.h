@@ -80,9 +80,14 @@ static constexpr const char* kFirmwareVersion = "0.0.0-placeholder";
 static constexpr const char* kPlaceholderFirmwareVersion = "0.0.0-placeholder";
 
 // Set the production root CA at flashing time (or load from NVS).
-static constexpr const char* kServerRootCaPem = R"PEM(
-
-)PEM";
+// Build profile (build_profiles/*.h)이 ICONIA_SERVER_ROOT_CA_PEM을 정의하면
+// 그 PEM bundle을 사용. 미정의 시 빈 문자열 → configureSecureClient에서
+// 기본 정책상 업로드 거부(kAllowInsecureTlsWhenRootCaMissing이 true가 아닌 한).
+#ifdef ICONIA_SERVER_ROOT_CA_PEM
+static constexpr const char* kServerRootCaPem = ICONIA_SERVER_ROOT_CA_PEM;
+#else
+static constexpr const char* kServerRootCaPem = "";
+#endif
 
 // S3 presigned URL용 별도 root CA. Amazon Trust Services 체인이 server
 // 엔드포인트 발급 CA와 다를 수 있으므로 분리. 운영에서는 빌드 시점에
@@ -209,6 +214,11 @@ static constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 static constexpr uint32_t kServerResponseTimeoutMs = 20000;
 static constexpr uint8_t kWifiRetryCount = 3;
 static constexpr uint8_t kUploadRetryCount = 3;
+// 부팅 간 영속 카운터. 한 번의 wake에서 모든 attempt가 WL_CONNECT_FAILED인 경우
+// (즉 인증 실패가 확실한 경우)만 1 증가. 임계치 도달 시 NVS wifi 자격증명 erase
+// → 다음 부팅에서 BLE provisioning 자동 진입. timeout/NO_SSID 등 일시 장애는
+// 카운터 영향 없음.
+static constexpr uint32_t kWifiAuthFailEraseThreshold = 3;
 static constexpr framesize_t kCaptureFrameSize = FRAMESIZE_VGA;
 static constexpr int kCaptureJpegQuality = 12;
 
