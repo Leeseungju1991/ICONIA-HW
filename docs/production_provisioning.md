@@ -285,6 +285,20 @@ echo "[INFO] secure_version is self-burned by firmware on first boot"
 
 ---
 
-## 6. 변경 이력
+## 6. PROD 도메인 / API key placeholder 치환 (양산 빌드 직전 필수)
+
+`build_profiles/prod.h` 의 두 매크로는 양산 빌드 직전 실값으로 교체:
+
+| 토큰 | 위치 | 교체 방법 |
+|------|------|-----------|
+| `ICONIA_PROD_DOMAIN_PLACEHOLDER` | `prod.h` line 33 | `sed -i` 또는 EAS secret 또는 `envsubst` |
+| `PROD_API_KEY_PLACEHOLDER` | `prod.h` line 34 | 운영 secrets manager 발급값 — 절대 git commit 금지 |
+
+치환 누락 시 firmware-ci 의 **`placeholder-guard` job 이 main merge / release tag 단계에서 자동 차단**한다 (검사 토큰: 위 2종 + `__FILL_ME__` / `placeholder` / `changeme` / `your-domain-here`). 양산 라인 운영자가 한 번이라도 빠뜨리면 100% 출하 실패하던 구조 → CI 가 사전 적출.
+
+---
+
+## 7. 변경 이력
 
 - v1 (2026-05-06): 초안. ESP32 classic + S3 분기 표기.
+- v1.1 (2026-05-06): §6 PROD placeholder 치환 체크리스트 + firmware-ci `placeholder-guard` 게이트 추가.

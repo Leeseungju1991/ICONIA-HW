@@ -288,3 +288,130 @@ jobs:
             echo "::error::Add the 'security-spec-change' label after coordinating with Server/AI/App repos."
             exit 1
           fi
+
+  # ---------------------------------------------------------------------------
+  # Job 5: prod placeholder 잔존 게이트 (양산 빌드 직전 자동 차단)
+  # ---------------------------------------------------------------------------
+  # 엔터프라이즈 평가 P0 #4 대응. prod 프로파일의 도메인/API key 자리표시자
+  # 토큰이 양산 빌드까지 살아남으면 출하 100% 실패. 양산 라인이 sed 치환을
+  # 빠뜨려도 main merge / release tag 시점에 자동 차단되도록 게이트.
+  #
+  # 검사 범위 (prod 컴파일 경로에 영향을 주는 매크로 정본만):
+  #   - ICONIA Firmware/build_profiles/prod.h   (핵심)
+  #   - ICONIA Firmware/iconia_config.h          (핵심 — fallback 매크로 포함)
+  #   - ICONIA Firmware/build.sh / build.bat     (치환 명령이 박힐 가능성)
+  #
+  # 의도적 제외:
+  #   - dev profile (build_profiles/dev.h) — DEV_API_KEY_PLACEHOLDER 합법.
+  #   - 주석 / 문서 (docs/, *.md, // / /* */) — placeholder 단어 자체가 정책
+  #     설명에 들어가는 것은 정상.
+  #   - 소스 코드의 placeholder 부팅 가드 변수 / 함수 이름 — 의도적 토큰.
+  #
+  # 매치 판정: `^[[:space:]]*#define[[:space:]]+...` 또는 매크로 값 문자열 안에
+  # 금지 토큰이 들어간 행만 fail. 즉 "진짜 매크로 정의" 만 차단한다.
+  #
+  # compile-prod 와 분리 — 매크로 5종 부재(compile-prod) 와 placeholder 잔존
+  # (본 job) 은 다른 실패 모드. 양쪽 모두 needs 체인에 들어가야 release 가능.
+  placeholder-guard:
+    name: Placeholder guard (prod build, no PROD_*_PLACEHOLDER tokens)
+    # main push 또는 release tag 시 활성. PR 단계에서도 사전 검출 위해
+    # pull_request 도 포함 (early-fail). dev profile 은 검사 대상 자체에서 제외.
+    if: >-
+      github.event_name == 'push'
+      || github.event_name == 'pull_request'
+      || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan prod-critical files for placeholder tokens
+        # 검사 패턴 6종:
+        #   ICONIA_PROD_DOMAIN_PLACEHOLDER / PROD_API_KEY_PLACEHOLDER
+        #   __FILL_ME__ / placeholder / changeme / your-domain-here
+        #
+        # 매치 판정 (false-positive 회피):
+        #   - 행 시작이 #define ... 인 라인에서, 매크로 값(") 안에 토큰 → fail.
+        #   - 단 dev profile (DEV_API_KEY_PLACEHOLDER) 는 검사 대상 자체가 아님.
+        #   - 주석 라인 (// ... 또는 /* ... 으로 시작) 은 grep -v 로 제외.
+        #   - 소스 코드의 placeholder 가드 변수명 (kPlaceholderApiKey 등) 은
+        #     #define 형태가 아니므로 자동 통과.
+        run: |
+          set -eu
+          shopt -s nocasematch || true
+
+          # 검사 대상 파일 목록 (존재하는 것만 검사 — 누락 시 grep 에러 방지).
+          targets=(
+            "ICONIA Firmware/build_profiles/prod.h"
+            "ICONIA Firmware/iconia_config.h"
+            "ICONIA Firmware/build.sh"
+            "ICONIA Firmware/build.bat"
+          )
+
+          # 금지 토큰 6종 (대소문자 구별 — 정확한 매크로명 일치 우선).
+          patterns=(
+            "ICONIA_PROD_DOMAIN_PLACEHOLDER"
+            "PROD_API_KEY_PLACEHOLDER"
+            "__FILL_ME__"
+            "your-domain-here"
+            "changeme"
+            "placeholder"
+          )
+
+          violations=0
+          for f in "${targets[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::notice file=$f::placeholder-guard target not present, skipping"
+              continue
+            fi
+            # 1) #define 라인만 추출 (선두 공백 허용). 주석 // 또는 /* 으로
+            #    시작하는 라인은 제외. dev profile 키 (DEV_API_KEY_PLACEHOLDER)
+            #    는 build_profiles/dev.h 에만 존재하는데 그 파일은 targets 에
+            #    포함하지 않으므로 자연스레 제외됨.
+            #
+            #    iconia_config.h 의 'placeholder' 단어는 모두 변수명 / 함수명 /
+            #    문자열 sentinel 이지 #define 매크로 값이 아니므로 본 grep 은
+            #    통과한다. 단 'placeholder' 토큰이 너무 광범위해 false-positive
+            #    위험이 있으므로 build.sh / build.bat 에 한해서만 'placeholder'
+            #    토큰을 평문 검사하고, .h 파일은 매크로 정의 행에 한정한다.
+            case "$f" in
+              *.h)
+                # #define X "...토큰..." 또는 #define X 토큰 형태만 검사.
+                define_lines="$(grep -nE '^[[:space:]]*#define[[:space:]]+' "$f" \
+                  | grep -vE '^[[:space:]]*//' \
+                  || true)"
+                ;;
+              *)
+                # build.sh / build.bat: 전체 비주석 행을 검사.
+                # shell 주석 (#) 또는 batch REM 라인은 제외.
+                define_lines="$(grep -nvE '^[[:space:]]*(#|REM[[:space:]])' "$f" \
+                  || true)"
+                ;;
+            esac
+
+            if [ -z "$define_lines" ]; then
+              continue
+            fi
+
+            for tok in "${patterns[@]}"; do
+              # build.sh / build.bat 의 'placeholder' 토큰은 변수 치환 명령
+              # (예: sed s/PLACEHOLDER/.../) 형태로 들어올 수 있는데, 본 게이트
+              # 목적상 그것도 차단 (치환 단계가 build.sh 안으로 흘러들어오는
+              # 안티패턴 방지). 진짜 치환은 docs/production_provisioning.md
+              # §6 의 외부 절차에서 수행해야 한다.
+              if echo "$define_lines" | grep -F "$tok" >/dev/null 2>&1; then
+                echo "::error file=$f::placeholder token '${tok}' survived in prod-critical file"
+                echo "$define_lines" | grep -nF "$tok" || true
+                violations=$((violations + 1))
+              fi
+            done
+          done
+
+          if [ "$violations" -ne 0 ]; then
+            echo "::error::prod 빌드 직전 placeholder 치환 누락. .github/CONTRIBUTING.md 의 양산 빌드 절차 §x 참고."
+            echo "::error::상세: docs/production_provisioning.md §6 'PROD 도메인/키 치환' 체크리스트."
+            exit 1
+          fi
+          echo "OK: no placeholder tokens in prod-critical files."
