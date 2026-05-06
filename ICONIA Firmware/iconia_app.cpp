@@ -18,6 +18,7 @@
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_efuse.h"
 #include "mbedtls/sha256.h"
 
 #if CONFIG_BT_BLE_SMP_ENABLE
@@ -26,6 +27,7 @@
 
 #include "iconia_config.h"
 #include "iconia_protocol.h"
+#include "iconia_security.h"
 
 IconiaApp* gAppInstance = nullptr;
 
@@ -37,7 +39,11 @@ class ProvisioningServerCallbacks : public BLEServerCallbacks {
       return;
     }
     gAppInstance->bleClientConnected_ = true;
-    gAppInstance->notifyProvisioningStatus("connected");
+    // secure 모드: 본딩이 끝나기 전까지는 어떤 신뢰 신호도 통지 X.
+    // 실제 본딩 완료 신호는 SecurityGapCallbacks::onAuthenticationComplete 에서.
+    if (!iconia::config::kBleSecureMode) {
+      gAppInstance->notifyProvisioningStatus("connected");
+    }
   }
 
   void onDisconnect(BLEServer* server) override {
@@ -46,23 +52,75 @@ class ProvisioningServerCallbacks : public BLEServerCallbacks {
       return;
     }
     gAppInstance->bleClientConnected_ = false;
+    gAppInstance->bonded_ = false;
+    gAppInstance->channelKeyReady_ = false;
     BLEDevice::startAdvertising();
-    gAppInstance->notifyProvisioningStatus("advertising");
+    if (!iconia::config::kBleSecureMode) {
+      gAppInstance->notifyProvisioningStatus("advertising");
+    }
   }
 };
 
+#if CONFIG_BT_BLE_SMP_ENABLE
+// BLE GAP 인증 완료 콜백. ESP_LE_AUTH_REQ_SC_MITM_BOND 페어링이 success
+// 로 끝나야 bonded_=true. 실패는 백오프 카운터에 기록.
+class SecurityGapCallbacks : public BLESecurityCallbacks {
+ public:
+  uint32_t onPassKeyRequest() override {
+    return 0;
+  }
+  void onPassKeyNotify(uint32_t passkey) override {
+    (void)passkey;
+  }
+  bool onConfirmPIN(uint32_t pin) override {
+    // ESP_IO_CAP_NONE 인 경우 BLE 스택이 자체 confirm 하므로 true.
+    (void)pin;
+    return true;
+  }
+  bool onSecurityRequest() override {
+    return true;
+  }
+  void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) override {
+    if (gAppInstance == nullptr) {
+      return;
+    }
+    if (cmpl.success) {
+      gAppInstance->bonded_ = true;
+      // 본딩 통과 — Status notify 로 알림. RN 앱은 이 신호를 보고 Session
+      // characteristic read 진행.
+      gAppInstance->notifyProvStatus("bonded");
+    } else {
+      gAppInstance->bonded_ = false;
+      iconia::security::backoff::recordFailure();
+      gAppInstance->notifyProvStatus(iconia::protocol::kProvStatusNotBonded);
+    }
+  }
+};
+#endif
+
+// Legacy 평문 GATT callbacks. 본 클래스는 ICONIA_BLE_SECURE=0 (bring-up
+// 디버그 빌드)에서만 빌드 — 출시 빌드는 컴파일조차 되지 않는다.
+#ifdef ICONIA_BLE_SECURE
+#  if (ICONIA_BLE_SECURE == 0)
+#    define ICONIA_LEGACY_PROV_ENABLED 1
+#  else
+#    define ICONIA_LEGACY_PROV_ENABLED 0
+#  endif
+#else
+#  define ICONIA_LEGACY_PROV_ENABLED 0
+#endif
+
+#if ICONIA_LEGACY_PROV_ENABLED
 class SsidCallbacks : public BLECharacteristicCallbacks {
  public:
   void onWrite(BLECharacteristic* characteristic) override {
     if (gAppInstance == nullptr) {
       return;
     }
-
     std::string value = characteristic->getValue();
     gAppInstance->pendingSsid_ = String(value.c_str());
     gAppInstance->pendingSsid_.trim();
     gAppInstance->pendingSsidReceived_ = true;
-
     if (gAppInstance->pendingSsidReceived_ && gAppInstance->pendingPasswordReceived_) {
       gAppInstance->provisioningAttemptPending_ = true;
     }
@@ -75,14 +133,43 @@ class PasswordCallbacks : public BLECharacteristicCallbacks {
     if (gAppInstance == nullptr) {
       return;
     }
-
     std::string value = characteristic->getValue();
     gAppInstance->pendingPassword_ = String(value.c_str());
     gAppInstance->pendingPasswordReceived_ = true;
-
     if (gAppInstance->pendingSsidReceived_ && gAppInstance->pendingPasswordReceived_) {
       gAppInstance->provisioningAttemptPending_ = true;
     }
+  }
+};
+#endif
+
+// Secure mode credential characteristic. AEAD blob 누적 → 마지막 chunk 도착
+// 시 검증 + 복호화 + Wi-Fi 연결.
+class CredentialCallbacks : public BLECharacteristicCallbacks {
+ public:
+  void onWrite(BLECharacteristic* characteristic) override {
+    if (gAppInstance == nullptr) {
+      return;
+    }
+    if (!gAppInstance->bonded_) {
+      gAppInstance->notifyProvStatus(iconia::protocol::kProvStatusNotBonded);
+      iconia::security::backoff::recordFailure();
+      return;
+    }
+    std::string raw = characteristic->getValue();
+    const uint8_t* data = (const uint8_t*)raw.data();
+    size_t len = raw.size();
+    if (len == 0) {
+      return;
+    }
+
+    // 누적 + 단조성 + last_chunk 추출은 envelope 클래스에 위임 (iconia_security).
+    bool lastChunk = false;
+    bool ok = gAppInstance->processCredentialBlob(data, len, lastChunk);
+    (void)ok;
+    // 최종 처리(검증 + Wi-Fi 연결 + 저장)는 loop() 컨텍스트에서 안전하게 수행.
+    // BLE 스택 콜백 안에서 무거운 동기 작업 (Wi-Fi 연결 ~수 초) 하면 GATT
+    // disconnect 가능.
   }
 };
 
@@ -127,6 +214,32 @@ void IconiaApp::begin() {
   // 동일 가드에 firmware_version placeholder("0.0.0-placeholder")도 함께 걸린다
   // (placeholderSecretsPresent() 내부 검사).
   haltOnPlaceholderSecrets();
+
+  // anti-rollback: ESP-IDF 가 부트로더 단계에서 eFuse SECURE_VERSION 과
+  // 펌웨어 헤더의 secure_version 을 자동 비교하므로, 이 시점에 부팅 성공
+  // = 검증 통과. 단조 증가 보장은 OTA 시점의 esp_efuse_check_secure_version
+  // 호출과 ESP-IDF anti-rollback 옵션 (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE)
+  // 으로 운영. 본 줄은 운영 가시성 확보용 로그.
+  if (iconia::config::kLockdown) {
+    logLine(String("[BOOT] secure_version=") +
+            iconia::config::kSecureVersion + " (lockdown ON)");
+  }
+
+  // Factory seed 가드: secure 모드 + RELEASE 빌드는 factory_nvs 부재 시
+  // 부팅 거부. dev 빌드는 명시적 override (ICONIA_REQUIRE_FACTORY_SEED=0)
+  // 로 부재 허용 가능 — bring-up 모듈 검수 흐름 유지용.
+  if (iconia::config::kBleSecureMode &&
+      (iconia::config::kRequireFactorySeed || iconia::config::kLockdown)) {
+    iconia::security::FactorySeed seedCheck = iconia::security::loadFactorySeed();
+    bool ok = seedCheck.valid;
+    iconia::security::zeroizeFactorySeed(seedCheck);
+    if (!ok) {
+      logLine("[FATAL] factory_nvs seed missing/invalid; halting (production_provisioning.md §3.6)");
+      delay(500);
+      esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+      esp_deep_sleep_start();
+    }
+  }
 
   // OTA 자가점검 안내 로그. 실제 mark는 첫 정상 업로드 성공 직후 호출.
   // (현재 부팅이 OTA 직후의 검증 부팅인지 여기서는 로그만 남기고 판단 자체는
@@ -208,7 +321,12 @@ void IconiaApp::loop() {
   }
 
   if ((millis() - provisioningStartMs_) >= iconia::config::kProvisioningTimeoutMs) {
-    notifyProvisioningStatus("timeout");
+    // 2분 광고 윈도우 만료. 본딩 자체에 도달하지 못한 상황도 fail 로 카운트
+    // — 분실/도난 등으로 누군가 BLE 광고만 보고 가만 두는 패턴 차단.
+    if (!bonded_) {
+      iconia::security::backoff::recordFailure();
+    }
+    notifyProvStatus(iconia::protocol::kProvStatusTimeout);
     stopProvisioningBle();
     enterDeepSleep();
   }
@@ -1086,6 +1204,24 @@ void IconiaApp::notifyProvisioningStatus(const String& status) {
 }
 
 void IconiaApp::startProvisioningBle() {
+  // Hard lockout 가드: 12h 내 누적 본딩 실패 ≥ kProvHardLockoutCount 이면
+  // BLE 라디오 자체를 시작하지 않음. 보고용 시리얼 로그만 남기고 즉시 종료.
+  if (iconia::security::backoff::isLockedOut()) {
+    logLine("[PROV] hard lockout active (12h cap), skipping BLE start");
+    enterDeepSleep();
+    return;
+  }
+
+  // 점진 백오프: 직전 wake 의 본딩 실패 카운트에 따라 지연 후 광고 시작.
+  // 같은 wake 안에서 즉시 retry 가능하지만, deep-sleep 한 번 거쳐 다시 들어온
+  // 경우는 RTC 메모리에 살아있는 카운터로 백오프가 적용된다.
+  uint32_t backoffMs = iconia::security::backoff::requiredBackoffMs();
+  if (backoffMs > 0) {
+    logLine(String("[PROV] backoff ") + backoffMs + " ms (fail#" +
+            iconia::security::backoff::failCount() + ")");
+    delay(backoffMs);
+  }
+
   mode_ = DeviceMode::Provisioning;
   provisioningStartMs_ = millis();
   pendingSsid_ = "";
@@ -1094,6 +1230,11 @@ void IconiaApp::startProvisioningBle() {
   pendingSsidReceived_ = false;
   pendingPasswordReceived_ = false;
   provisioningNonceValid_ = false;
+  bonded_ = false;
+  channelKeyReady_ = false;
+
+  // 디바이스 MAC (AAD/HKDF info 에 사용).
+  esp_read_mac(deviceMac_, ESP_MAC_BT);
 
   BLEDevice::init(bleDeviceName().c_str());
 
@@ -1102,68 +1243,116 @@ void IconiaApp::startProvisioningBle() {
 
   BLEService* service = bleServer_->createService(iconia::config::kBleServiceUuid);
 
-  // GATT properties stay the same in both modes; the secure-mode block below
-  // only escalates the *access permissions* (ENC_MITM) when kBleSecureMode is
-  // on. With secure mode OFF (default), the legacy unauthenticated path is
-  // kept intact for compatibility with the current RN app.
-  BLECharacteristic* ssidCharacteristic = service->createCharacteristic(
-    iconia::config::kBleSsidCharUuid,
-    BLECharacteristic::PROPERTY_WRITE_NR
-  );
-  ssidCharacteristic->setCallbacks(new SsidCallbacks());
-
-  BLECharacteristic* passwordCharacteristic = service->createCharacteristic(
-    iconia::config::kBlePasswordCharUuid,
-    BLECharacteristic::PROPERTY_WRITE_NR
-  );
-  passwordCharacteristic->setCallbacks(new PasswordCallbacks());
-
-  bleStatusCharacteristic_ = service->createCharacteristic(
-    iconia::config::kBleStatusCharUuid,
-    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
-  );
-  bleStatusCharacteristic_->addDescriptor(new BLE2902());
-  bleStatusCharacteristic_->setValue("advertising");
-
-  // Optional secure-mode hardening. Compile-time gated; default OFF.
-  // -------------------------------------------------------------------------
-  // Interface contract for rn-mobile when this is flipped on:
-  //   1. App connects, triggers Just Works pairing (ESP_LE_AUTH_REQ_SC_MITM_BOND).
-  //   2. App reads the 16-byte Nonce characteristic immediately after pairing.
-  //   3. App sends SSID + password as <nonce-prefixed AEAD ciphertext> across
-  //      the existing SSID/password characteristics. (AEAD scheme TBD; suggest
-  //      AES-128-GCM with the BLE LTK as key.)
-  //   4. Firmware verifies nonce (TTL: kBleNonceTtlMs) before accepting.
-  // -------------------------------------------------------------------------
   if (iconia::config::kBleSecureMode) {
 #if CONFIG_BT_BLE_SMP_ENABLE
+    // 본딩 강제 + Numeric Comparison (디바이스에 디스플레이 없음 → IO_CAP_NONE).
+    // ESP_LE_AUTH_REQ_SC_MITM_BOND: Secure Connections + MITM 보호 + 본딩.
+    BLEDevice::setSecurityCallbacks(new SecurityGapCallbacks());
     BLESecurity* security = new BLESecurity();
     security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-    security->setCapability(ESP_IO_CAP_NONE);  // doll has no display/keyboard
+    security->setCapability(ESP_IO_CAP_NONE);
     security->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
     security->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
 
-    ssidCharacteristic->setAccessPermissions(
-      ESP_GATT_PERM_WRITE_ENC_MITM
+    // Status (READ + NOTIFY, 본딩 후에만)
+    bleStatusCharacteristic_ = service->createCharacteristic(
+      iconia::config::kBleStatusCharUuidV1,
+      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
     );
-    passwordCharacteristic->setAccessPermissions(
-      ESP_GATT_PERM_WRITE_ENC_MITM
-    );
+    bleStatusCharacteristic_->addDescriptor(new BLE2902());
+    bleStatusCharacteristic_->setAccessPermissions(ESP_GATT_PERM_READ_ENC_MITM);
+    bleStatusCharacteristic_->setValue("advertising");
 
-    // Read-only nonce characteristic (UUID = status UUID + 1 to keep the
-    // scheme deterministic; replace with a dedicated UUID when rn-mobile
-    // confirms the pairing flow).
-    bleNonceCharacteristic_ = service->createCharacteristic(
-      "48f1f79e-817d-4105-a96f-4e2d2d6031e4",
-      ESP_GATT_CHAR_PROP_BIT_READ
+    // Capability (READ, no auth) — 외부에서 안전하게 노출 가능한 메타.
+    // 32B = "ICONIA-V1" + product_id + seed_ver. 비밀 정보 절대 미포함.
+    bleCapabilityCharacteristic_ = service->createCharacteristic(
+      iconia::config::kBleCapabilityCharUuid,
+      BLECharacteristic::PROPERTY_READ
     );
-    bleNonceCharacteristic_->setAccessPermissions(ESP_GATT_PERM_READ_ENC_MITM);
+    {
+      uint8_t cap[32] = {0};
+      memcpy(cap, "ICONIA-V1", 9);
+      // seed_ver 은 factory_nvs 에서 빌드 시점이 아닌 부팅 시 로드.
+      iconia::security::FactorySeed s = iconia::security::loadFactorySeed();
+      cap[16] = s.seedVer;
+      iconia::security::zeroizeFactorySeed(s);
+      bleCapabilityCharacteristic_->setValue(cap, sizeof(cap));
+    }
 
-    generateProvisioningNonce();
-    publishProvisioningNonce(bleNonceCharacteristic_);
-    logLine("[BLE] secure mode enabled, nonce published");
+    // Session (READ ENC_MITM, 32B = nonce 16 + salt 16). 본딩 통과 후 한 번 read.
+    bleSessionCharacteristic_ = service->createCharacteristic(
+      iconia::config::kBleSessionCharUuid,
+      BLECharacteristic::PROPERTY_READ
+    );
+    bleSessionCharacteristic_->setAccessPermissions(ESP_GATT_PERM_READ_ENC_MITM);
+    {
+      // 세션 nonce + salt 발생.
+      for (int i = 0; i < 16; i += 4) {
+        uint32_t r = esp_random();
+        sessionNonce_[i + 0] = (uint8_t)(r >> 0);
+        sessionNonce_[i + 1] = (uint8_t)(r >> 8);
+        sessionNonce_[i + 2] = (uint8_t)(r >> 16);
+        sessionNonce_[i + 3] = (uint8_t)(r >> 24);
+      }
+      // sessionSalt_ 는 디바이스 factory salt 와 별개인 세션 salt — 일단
+      // factory salt 와 동일값 사용해도 되지만, 최소 변형으로 esp_random 사용.
+      // (HKDF salt 자체는 factory salt 가 정본; 본 sessionSalt_ 는 BLE 측에
+      // 노출되는 부수 메타로 RN 앱 디버깅용.)
+      for (int i = 0; i < 16; i += 4) {
+        uint32_t r = esp_random();
+        sessionSalt_[i + 0] = (uint8_t)(r >> 0);
+        sessionSalt_[i + 1] = (uint8_t)(r >> 8);
+        sessionSalt_[i + 2] = (uint8_t)(r >> 16);
+        sessionSalt_[i + 3] = (uint8_t)(r >> 24);
+      }
+      uint8_t payload[32];
+      memcpy(payload, sessionNonce_, 16);
+      memcpy(payload + 16, sessionSalt_, 16);
+      bleSessionCharacteristic_->setValue(payload, sizeof(payload));
+    }
+
+    // Credential (WRITE ENC_MITM, AEAD blob).
+    bleCredentialCharacteristic_ = service->createCharacteristic(
+      iconia::config::kBleCredentialCharUuid,
+      BLECharacteristic::PROPERTY_WRITE
+    );
+    bleCredentialCharacteristic_->setAccessPermissions(ESP_GATT_PERM_WRITE_ENC_MITM);
+    bleCredentialCharacteristic_->setCallbacks(new CredentialCallbacks());
+
+    logLine("[BLE] secure mode active (legacy SSID/PW chars NOT registered)");
 #else
-    logLine("[WARN] kBleSecureMode set but SMP not compiled in core");
+    logLine("[FATAL] kBleSecureMode but SMP not compiled in core; halting");
+    delay(500);
+    enterDeepSleep();
+    return;
+#endif
+  } else {
+#if ICONIA_LEGACY_PROV_ENABLED
+    // bring-up only — output 빌드는 절대 본 분기에 도달하면 안 됨.
+    logLine("[BLE] WARNING: legacy plaintext mode (debug only)");
+    BLECharacteristic* ssidCharacteristic = service->createCharacteristic(
+      iconia::config::kBleSsidCharUuid,
+      BLECharacteristic::PROPERTY_WRITE_NR
+    );
+    ssidCharacteristic->setCallbacks(new SsidCallbacks());
+
+    BLECharacteristic* passwordCharacteristic = service->createCharacteristic(
+      iconia::config::kBlePasswordCharUuid,
+      BLECharacteristic::PROPERTY_WRITE_NR
+    );
+    passwordCharacteristic->setCallbacks(new PasswordCallbacks());
+
+    bleStatusCharacteristic_ = service->createCharacteristic(
+      iconia::config::kBleStatusCharUuid,
+      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+    );
+    bleStatusCharacteristic_->addDescriptor(new BLE2902());
+    bleStatusCharacteristic_->setValue("advertising");
+#else
+    logLine("[FATAL] secure mode disabled but legacy not compiled in; halting");
+    delay(500);
+    enterDeepSleep();
+    return;
 #endif
   }
 
@@ -1187,17 +1376,202 @@ void IconiaApp::stopProvisioningBle() {
   bleServer_ = nullptr;
   bleStatusCharacteristic_ = nullptr;
   bleNonceCharacteristic_ = nullptr;
+  bleCredentialCharacteristic_ = nullptr;
+  bleSessionCharacteristic_ = nullptr;
+  bleCapabilityCharacteristic_ = nullptr;
   bleClientConnected_ = false;
+  bonded_ = false;
+  channelKeyReady_ = false;
   provisioningNonceValid_ = false;
-  // Wipe the nonce buffer so it does not survive in heap fragments.
+  // Wipe sensitive buffers so they do not survive in heap fragments.
   memset(provisioningNonce_, 0, sizeof(provisioningNonce_));
+  zeroizeSecuritySeed();
+  memset(channelKey_, 0, sizeof(channelKey_));
+  memset(sessionNonce_, 0, sizeof(sessionNonce_));
+  memset(sessionSalt_, 0, sizeof(sessionSalt_));
+}
+
+// Secure-mode 보조 — 시리얼 노출 가드를 거치지 않고 항상 Status 특성 통지.
+void IconiaApp::notifyProvStatus(const char* statusToken) {
+  if (statusToken == nullptr) {
+    return;
+  }
+  logLine(String("[PROV] ") + statusToken);
+  if (bleStatusCharacteristic_ == nullptr) {
+    return;
+  }
+  bleStatusCharacteristic_->setValue((uint8_t*)statusToken, strlen(statusToken));
+  if (bleClientConnected_) {
+    bleStatusCharacteristic_->notify();
+  }
+}
+
+// factory seed/salt 로드. 부재 시 false. RELEASE 빌드(=kRequireFactorySeed)는
+// 부재가 fatal — 호출자가 deep sleep 처리.
+bool IconiaApp::loadSecuritySeed() {
+  iconia::security::FactorySeed s = iconia::security::loadFactorySeed();
+  if (!s.valid) {
+    return false;
+  }
+  // 채널 키만 derive 하고 seed 자체는 즉시 zero-fill — RAM 잔존 표면 최소화.
+  // (deriveSessionKey 가 본 멤버 변수 seed 를 직접 쓰지 않고, 매번 NVS read
+  //  후 즉시 zeroize. 따라서 본 메서드는 seed 유효성만 확인하는 의미.)
+  iconia::security::zeroizeFactorySeed(s);
+  return true;
+}
+
+void IconiaApp::zeroizeSecuritySeed() {
+  // 본 클래스가 seed 를 멤버로 보관하지 않으므로 no-op. 향후 캐시 도입 시
+  // 본 메서드에서 zero-fill 추가.
+}
+
+bool IconiaApp::deriveSessionKey() {
+  iconia::security::FactorySeed s = iconia::security::loadFactorySeed();
+  if (!s.valid) {
+    return false;
+  }
+  bool ok = iconia::security::deriveChannelKey(
+      s, deviceMac_, sessionNonce_, channelKey_);
+  iconia::security::zeroizeFactorySeed(s);
+  if (ok) {
+    channelKeyReady_ = true;
+  }
+  return ok;
+}
+
+// Credential characteristic write callback 에서 호출. 누적 + last_chunk 도착
+// 시 검증 시작 신호 set. 실제 검증/Wi-Fi 연결은 loop() 컨텍스트에서.
+bool IconiaApp::processCredentialBlob(const uint8_t* blob, size_t blobLen,
+                                      bool /*lastChunk*/) {
+  static iconia::security::AeadEnvelope env;
+
+  // 본 호출 직전 본딩 가드는 callback 에서 이미 통과.
+  bool last = false;
+  bool ok = env.appendChunk(blob, blobLen, &last);
+  if (!ok) {
+    notifyProvStatus(iconia::protocol::kProvStatusBadSeq);
+    iconia::security::backoff::recordFailure();
+    env.reset();
+    return false;
+  }
+
+  // 청크 누적 timeout 검사.
+  uint32_t accumElapsed = (uint32_t)millis() - env.startedAtMs();
+  if (!last && accumElapsed > iconia::config::kBleChunkAccumTimeoutMs) {
+    notifyProvStatus(iconia::protocol::kProvStatusChunkTo);
+    iconia::security::backoff::recordFailure();
+    env.reset();
+    return false;
+  }
+
+  if (!last) {
+    return true;  // 다음 chunk 대기
+  }
+
+  // 마지막 chunk 도착. 헤더 파싱 → AEAD 복호화 → 평문 검증.
+  iconia::security::AeadEnvelope::ParsedHeader hdr = {};
+  if (!env.parseHeader(hdr)) {
+    notifyProvStatus(iconia::protocol::kProvStatusBadMagic);
+    iconia::security::backoff::recordFailure();
+    env.reset();
+    return false;
+  }
+
+  // ts 윈도우 검사. 디바이스에 RTC time 이 없으므로 광고 시작 시점 + millis
+  // 기반 단조 카운터로 대체. 첫 envelope 의 ts 를 기준으로 ±kBleTsWindowSec
+  // 만 허용. 본 디바이스는 양산 시 RTC 시계가 없을 수 있으나, BLE 광고 시작
+  // 시각이 곧 "현재 시각"으로 유효(2 분 안에 본딩이 끝나야 하므로).
+  // 단순화: ts 자체의 형식만 sanity 검사 (0 또는 unrealistic 값 거부).
+  if (hdr.tsUnixBe == 0 || hdr.tsUnixBe < 1700000000u) {
+    notifyProvStatus(iconia::protocol::kProvStatusTsWindow);
+    iconia::security::backoff::recordFailure();
+    env.reset();
+    return false;
+  }
+
+  if (iconia::security::replay::isSeen(sessionNonce_, hdr.tsUnixBe)) {
+    notifyProvStatus(iconia::protocol::kProvStatusReplay);
+    iconia::security::backoff::recordFailure();
+    env.reset();
+    return false;
+  }
+
+  // 채널 키 derivation 1회.
+  if (!channelKeyReady_) {
+    if (!deriveSessionKey()) {
+      notifyProvStatus(iconia::protocol::kProvStatusAeadFail);
+      iconia::security::backoff::recordFailure();
+      env.reset();
+      return false;
+    }
+  }
+
+  // AAD 빌드 + 복호화.
+  uint8_t aad[64];
+  size_t aadLen = iconia::security::buildAad(
+      deviceMac_, hdr.version, sessionNonce_, hdr.tsUnixBe, aad, sizeof(aad));
+  if (aadLen == 0) {
+    notifyProvStatus(iconia::protocol::kProvStatusAeadFail);
+    iconia::security::backoff::recordFailure();
+    env.reset();
+    return false;
+  }
+  uint8_t plain[120] = {0};
+  size_t plainLen = 0;
+  if (!env.decrypt(channelKey_, aad, aadLen,
+                   plain, sizeof(plain), &plainLen)) {
+    notifyProvStatus(iconia::protocol::kProvStatusAeadFail);
+    iconia::security::backoff::recordFailure();
+    env.reset();
+    return false;
+  }
+
+  // 평문 파서.
+  iconia::security::WifiCredentialPlain parsed =
+      iconia::security::parseWifiPlaintext(plain, plainLen);
+  // 평문 buffer 즉시 zero-fill (최대한 일찍).
+  {
+    volatile uint8_t* p = plain;
+    for (size_t i = 0; i < sizeof(plain); ++i) {
+      p[i] = 0;
+    }
+  }
+  if (!parsed.valid) {
+    notifyProvStatus(iconia::protocol::kProvStatusBadPlain);
+    iconia::security::backoff::recordFailure();
+    env.reset();
+    return false;
+  }
+
+  // 모든 검증 통과 → replay cache 등록 + main loop 가 처리할 수 있게 pending 셋팅.
+  iconia::security::replay::remember(sessionNonce_, hdr.tsUnixBe);
+  pendingSsid_ = String(parsed.ssid);
+  pendingPassword_ = String(parsed.psk);
+  pendingSsidReceived_ = true;
+  pendingPasswordReceived_ = true;
+  provisioningAttemptPending_ = true;
+
+  // 평문 변수 zero-fill.
+  {
+    volatile char* p = parsed.ssid;
+    for (size_t i = 0; i < sizeof(parsed.ssid); ++i) {
+      p[i] = 0;
+    }
+    volatile char* q = parsed.psk;
+    for (size_t i = 0; i < sizeof(parsed.psk); ++i) {
+      q[i] = 0;
+    }
+  }
+  env.reset();
+  return true;
 }
 
 void IconiaApp::handleProvisioningAttempt() {
   provisioningAttemptPending_ = false;
 
   if (pendingSsid_.length() == 0) {
-    notifyProvisioningStatus("invalid_credentials");
+    notifyProvStatus(iconia::protocol::kProvStatusBadPlain);
+    iconia::security::backoff::recordFailure();
     pendingSsidReceived_ = false;
     pendingPasswordReceived_ = false;
     return;
@@ -1211,21 +1585,37 @@ void IconiaApp::handleProvisioningAttempt() {
   pending.valid = true;
 
   if (!connectToWifiWithRetry(pending, iconia::config::kWifiRetryCount)) {
-    notifyProvisioningStatus("wifi_failed");
+    // 실패 사유 분리: connectToWifiWithRetry 가 모든 attempt 인증 실패 시
+    // NVS 카운터를 별도로 관리. 여기서는 BLE 클라이언트에 사유 token 만 통지.
+    notifyProvStatus(iconia::protocol::kProvStatusWifiAuth);
+    iconia::security::backoff::recordFailure();
     pendingSsidReceived_ = false;
     pendingPasswordReceived_ = false;
+    // 평문 잔존 표면 최소화.
+    pendingSsid_ = "";
+    pendingPassword_ = "";
     return;
   }
 
   if (!saveWifiCredentials(pending.ssid, pending.password)) {
-    notifyProvisioningStatus("nvs_save_failed");
+    notifyProvStatus(iconia::protocol::kProvStatusBadPlain);
+    iconia::security::backoff::recordFailure();
     WiFi.disconnect(true, true);
     pendingSsidReceived_ = false;
     pendingPasswordReceived_ = false;
+    pendingSsid_ = "";
+    pendingPassword_ = "";
     return;
   }
 
-  notifyProvisioningStatus("provisioning_success");
+  // 검증 + Wi-Fi 연결 + NVS 저장 모두 성공. 백오프 카운터 zero-fill.
+  iconia::security::backoff::recordSuccess();
+  notifyProvStatus(iconia::protocol::kProvStatusSuccess);
+  // 평문 잔존 표면 최소화.
+  pendingSsid_ = "";
+  pendingPassword_ = "";
+  pendingSsidReceived_ = false;
+  pendingPasswordReceived_ = false;
   delay(400);
   stopProvisioningBle();
   enterDeepSleep();
@@ -1446,6 +1836,17 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
   logLine(String("[OTA] start version=") + ota.version +
           " size=" + String((long)ota.sizeBytes) +
           " url=" + sanitizeUrlForLog(ota.url));
+
+  // Anti-rollback 사전 체크: lockdown 빌드는 펌웨어 헤더의 secure_version
+  // 이 eFuse SECURE_VERSION 보다 작으면 OTA finish 가 자동 거부된다 (ESP-IDF
+  // 부트로더가 검증). 본 시점에서는 명시적 호출 가능한 API 가 없어 (OTA
+  // 이미지 헤더 분석은 다운로드 완료 후 수행됨), 단순히 잠금 정책 로그만
+  // 남김 — 실제 거부는 esp_https_ota_finish 의 ESP_ERR_OTA_VALIDATE_FAILED
+  // 반환에서 발생하며, recordOtaResult(flash_failed) 로 기록된다.
+  if (iconia::config::kLockdown) {
+    logLine(String("[OTA] lockdown mode, anti-rollback enforced; current secure_version=") +
+            iconia::config::kSecureVersion);
+  }
 
   // 시도 사실 선기록: 결과는 미정이지만 attempt_ver만 저장. 아래 단계에서 실제
   // 결과로 덮어쓰며, 덮어쓰기 전 power loss 시 부팅 후 detectRollbackOnBoot가

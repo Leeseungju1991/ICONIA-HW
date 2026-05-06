@@ -47,5 +47,60 @@ static constexpr const char* kOtaResultFlashFailed = "flash_failed";
 static constexpr const char* kOtaResultRolledBack = "rolled_back";
 static constexpr const char* kOtaResultVersionRejected = "version_rejected";
 
+// ---------------------------------------------------------------------------
+// BLE secure provisioning (정본 스펙: HW/docs/security_handshake.md)
+// ---------------------------------------------------------------------------
+// 본 상수들은 펌웨어/모바일/문서 세 곳이 동일하게 참조해야 한다. 변경 시
+// security_handshake.md 의 §3 envelope, §8 error codes 와 동시 갱신.
+
+// 봉투 magic + 버전. magic = ASCII "ICN1".
+static constexpr uint32_t kProvEnvMagicLE = 0x314E4349u;  // little-endian: 'I''C''N''1'
+static constexpr uint8_t  kProvEnvVersion = 0x01;
+
+// 고정 길이 (security_handshake.md §3.2)
+static constexpr size_t kProvMagicLen      = 4;
+static constexpr size_t kProvVersionLen    = 1;
+static constexpr size_t kProvFlagsLen      = 1;
+static constexpr size_t kProvSeqLen        = 2;
+static constexpr size_t kProvTsLen         = 4;
+static constexpr size_t kProvIvLen         = 12;   // AES-GCM IV
+static constexpr size_t kProvCtLenLen      = 2;
+static constexpr size_t kProvTagLen        = 16;   // AES-GCM auth tag
+static constexpr size_t kProvHeaderLen =
+    kProvMagicLen + kProvVersionLen + kProvFlagsLen + kProvSeqLen +
+    kProvTsLen + kProvIvLen + kProvCtLenLen;        // = 26
+
+static constexpr uint8_t kProvFlagLastChunk = 0x01;
+
+// AAD prefix string (security_handshake.md §3.3)
+static constexpr const char* kProvAadPrefix = "ICONIA-PROV-AAD-v1";
+
+// HKDF info string (security_handshake.md §1.2)
+static constexpr const char* kProvHkdfInfoPrefix = "ICONIA-PROV-CH-v1";
+
+// Plaintext field bounds (security_handshake.md §3.1)
+static constexpr size_t kProvSsidMax = 32;
+static constexpr size_t kProvPskMax  = 63;
+static constexpr size_t kProvReservedLen = 8;
+
+// 누적 AEAD blob 최대치. 단일 chunk MTU(=20~244) 보다 충분히 크되, 무한
+// append 공격 차단. 펌웨어는 누적 길이 > kProvMaxBlobLen 이면 즉시 abort.
+static constexpr size_t kProvMaxBlobLen = 512;
+
+// Status notify payload 형식: "0xNN:label". 코드는 §8 와 일치해야 한다.
+static constexpr const char* kProvStatusSuccess     = "0x00:success";
+static constexpr const char* kProvStatusNotBonded   = "0x01:not_bonded";
+static constexpr const char* kProvStatusBadMagic    = "0x02:bad_magic";
+static constexpr const char* kProvStatusBadSeq      = "0x03:bad_seq";
+static constexpr const char* kProvStatusChunkTo     = "0x04:chunk_timeout";
+static constexpr const char* kProvStatusTsWindow    = "0x05:ts_window";
+static constexpr const char* kProvStatusReplay      = "0x06:replay";
+static constexpr const char* kProvStatusAeadFail    = "0x07:aead_fail";
+static constexpr const char* kProvStatusBadPlain    = "0x08:bad_plaintext";
+static constexpr const char* kProvStatusWifiAuth    = "0x09:wifi_auth_fail";
+static constexpr const char* kProvStatusWifiNoAp    = "0x0A:wifi_no_ap";
+static constexpr const char* kProvStatusLockedOut   = "0xFE:locked_out";
+static constexpr const char* kProvStatusTimeout     = "0xFF:timeout";
+
 }  // namespace protocol
 }  // namespace iconia

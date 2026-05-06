@@ -1,0 +1,290 @@
+name: firmware-ci
+
+# ICONIA HW 펌웨어 CI 게이트.
+#
+# 정본 빌드 시퀀스: HW/ICONIA Firmware/build.sh
+# 보안 잠금 정본:   HW/docs/security_handshake.md, HW/docs/production_provisioning.md
+#
+# 본 워크플로우는 다음을 차단한다:
+#   1) dev 컴파일 경고 회귀
+#   2) prod 잠금 매크로 누락 (build.sh 가 exit 2 로 차단하는 동작 검증)
+#   3) 비공개 키 / lot CSV 의 의도치 않은 commit
+#   4) security_handshake / production_provisioning 변경 PR 의 라벨 누락
+#      (Server/AI/App 리포 정합 깨짐 방지)
+#
+# fqbn 은 build.sh 와 정합: ESP32-WROOM-32 + OV2640 + Li-Po 의 ESP32 클래식 (S3 아님).
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  ARDUINO_FQBN: esp32:esp32:esp32cam
+  SKETCH_DIR: ICONIA Firmware
+  ARDUINO_CLI_VERSION: 1.0.4
+  ESP32_CORE_VERSION: 2.0.17
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: dev 프로파일 컴파일 — 경고 0 강제
+  # ---------------------------------------------------------------------------
+  compile-dev:
+    name: Compile (dev profile, warnings=all)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache arduino-cli core (~/.arduino15)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-${{ runner.os }}-esp32-${{ env.ESP32_CORE_VERSION }}-v1
+          restore-keys: |
+            arduino-${{ runner.os }}-esp32-
+
+      - name: Install arduino-cli
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | BINDIR="$HOME/bin" sh -s ${{ env.ARDUINO_CLI_VERSION }}
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Init arduino-cli + ESP32 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@${{ env.ESP32_CORE_VERSION }}
+
+      - name: Build (dev profile via build.sh)
+        working-directory: ${{ env.SKETCH_DIR }}
+        run: |
+          chmod +x ./build.sh
+          ./build.sh dev 2>&1 | tee build-dev.log
+          # 경고 0 강제 — arduino-cli --warnings all 출력 중 'warning:' 패턴 차단.
+          # 단순 grep 으로 라이브러리 경로상 경고까지 잡힌다 (의도적으로 엄격).
+          if grep -E "(^|[[:space:]])warning:" build-dev.log; then
+            echo "::error::Compiler warnings detected in dev build (warnings=all is gating)."
+            exit 1
+          fi
+
+      - name: Upload dev build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-dev-log
+          path: ${{ env.SKETCH_DIR }}/build-dev.log
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 2: prod 프로파일 컴파일 — build.sh 의 prod 매크로 가드 동작 검증
+  # ---------------------------------------------------------------------------
+  # build.sh prod 는 ICONIA_PRODUCTION_BUILD / ICONIA_BLE_SECURE /
+  # ICONIA_REQUIRE_FACTORY_SEED / ICONIA_LOCKDOWN / ICONIA_SECURE_VERSION 5개
+  # 매크로 부재 시 exit 2 차단한다. CI 도 동일 경로를 거쳐 그 가드를 검증한다.
+  #
+  # 서명 / eFuse burn 단계는 양산 라인 fixture 의 책임 (비공개 키가 CI 에
+  # 노출되지 않도록 의도적 분리). 본 job 은 unsigned 컴파일까지만 수행.
+  compile-prod:
+    name: Compile (prod profile, lockdown macros required)
+    needs: compile-dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache arduino-cli core (~/.arduino15)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-${{ runner.os }}-esp32-${{ env.ESP32_CORE_VERSION }}-v1
+          restore-keys: |
+            arduino-${{ runner.os }}-esp32-
+
+      - name: Install arduino-cli
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | BINDIR="$HOME/bin" sh -s ${{ env.ARDUINO_CLI_VERSION }}
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Init arduino-cli + ESP32 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@${{ env.ESP32_CORE_VERSION }}
+
+      - name: Verify prod lockdown macros present (pre-build assertion)
+        # build.sh prod 가 exit 2 차단하는 동작을 CI 에서 한 번 더 가시화.
+        # 이 step 이 build.sh 보다 먼저 실패하더라도 본 job 은 fail 한다.
+        working-directory: ${{ env.SKETCH_DIR }}
+        run: |
+          PROD="build_profiles/prod.h"
+          missing=0
+          for mac in ICONIA_PRODUCTION_BUILD ICONIA_BLE_SECURE \
+                     ICONIA_REQUIRE_FACTORY_SEED ICONIA_LOCKDOWN \
+                     ICONIA_SECURE_VERSION; do
+            if ! grep -q "^#define ${mac}" "${PROD}"; then
+              echo "::error file=${{ env.SKETCH_DIR }}/${PROD}::prod profile missing required macro ${mac}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::prod lockdown macro(s) missing — refer to docs/production_provisioning.md"
+            exit 2
+          fi
+
+      - name: Build (prod profile via build.sh, unsigned)
+        working-directory: ${{ env.SKETCH_DIR }}
+        run: |
+          chmod +x ./build.sh
+          ./build.sh prod 2>&1 | tee build-prod.log
+          # prod 빌드도 경고 0 — 운영 출하 직전이므로 dev 보다 더 엄격.
+          if grep -E "(^|[[:space:]])warning:" build-prod.log; then
+            echo "::error::Compiler warnings detected in prod build."
+            exit 1
+          fi
+
+      - name: Skip signing step (signing keys live in production fixture)
+        run: |
+          echo "[CI] prod artifact is intentionally unsigned."
+          echo "[CI] espsecure.py sign + espefuse.py burn happen in production line"
+          echo "[CI] (docs/production_provisioning.md §3 Step 2-7). Signing keys are"
+          echo "[CI] not exposed to GitHub Actions by design."
+
+      - name: Upload prod build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-prod-log
+          path: ${{ env.SKETCH_DIR }}/build-prod.log
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 3: 비공개 키 / 시리얼 lot 파일이 트리에 들어왔는지 차단
+  # ---------------------------------------------------------------------------
+  # 양산 서명 키, 디바이스별 factory_nvs seed, lot CSV 등은 절대 리포에
+  # 들어와선 안 된다. .gitignore 만으로는 신규 파일 누락이 가능하므로
+  # CI 에서 강제 검사. gitleaks 미설치 환경 호환을 위해 grep 기반 fallback.
+  secure-boot-precondition:
+    name: Secure-boot precondition (no private keys in tree)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for forbidden artifact paths
+        run: |
+          set -eu
+          forbidden=0
+          # 1) 디렉토리: secrets/
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            echo "::error file=$path::forbidden path under secrets/ directory"
+            forbidden=1
+          done < <(git ls-files | grep -E '^secrets/' || true)
+          # 2) 확장자 패턴: *.pem, *.der, *.priv, *_priv.*, *.key
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            echo "::error file=$path::forbidden private-key-like artifact"
+            forbidden=1
+          done < <(git ls-files | grep -E '(\.pem$|\.der$|\.priv$|_priv\.|\.key$)' || true)
+          # 3) lot CSV (양산 시리얼 / seed 묶음 — 리포에 절대 금지)
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            echo "::error file=$path::forbidden lot/serial CSV"
+            forbidden=1
+          done < <(git ls-files | grep -iE '(^|/)lot[^/]*\.csv$|(^|/)serials?[^/]*\.csv$|factory_seed.*\.csv$' || true)
+          if [ "$forbidden" -ne 0 ]; then
+            echo "::error::Forbidden secret artifacts found in tree. See docs/production_provisioning.md."
+            exit 1
+          fi
+          echo "OK: no forbidden secret artifacts in tree."
+
+      - name: Try gitleaks (best-effort, non-blocking install)
+        # gitleaks 가 일시 다운로드 실패해도 위 grep gate 가 1차 보장. 본 step 은
+        # 추가 신호용. 설치 실패는 경고만 남기고 통과.
+        continue-on-error: true
+        run: |
+          set -e
+          GL_VER="8.18.4"
+          GL_TGZ="gitleaks_${GL_VER}_linux_x64.tar.gz"
+          if curl -fsSL -o /tmp/gl.tgz \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VER}/${GL_TGZ}"; then
+            tar -xzf /tmp/gl.tgz -C /tmp gitleaks
+            /tmp/gitleaks detect --source . --redact --no-banner --exit-code 1 \
+              || { echo "::error::gitleaks detected secrets"; exit 1; }
+          else
+            echo "::warning::gitleaks download failed; relying on grep gate above."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 4: 핸드셰이크 / 양산 명세 문서 변경 PR 은 라벨 강제
+  # ---------------------------------------------------------------------------
+  # security_handshake.md / production_provisioning.md 가 변경되면 Server / AI /
+  # App 리포 정합이 깨질 수 있다. PR 에 'security-spec-change' 라벨을 강제해
+  # 사람의 의식적 검토를 유도한다 (label gate 는 force-merge 방지가 아니라 서명).
+  handshake-doc-guard:
+    name: Handshake doc guard (label required on spec change)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect handshake/provisioning doc change
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          changed="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" || true)"
+          if echo "$changed" | grep -E '^docs/(security_handshake|production_provisioning)\.md$' >/dev/null; then
+            echo "spec_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Spec doc(s) changed in this PR:"
+            echo "$changed" | grep -E '^docs/(security_handshake|production_provisioning)\.md$'
+          else
+            echo "spec_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require 'security-spec-change' label
+        if: steps.detect.outputs.spec_changed == 'true'
+        env:
+          LABELS_JSON: ${{ toJson(github.event.pull_request.labels) }}
+        run: |
+          set -eu
+          # github.event.pull_request.labels 는 [{name: ...}, ...] 배열.
+          # jq 없이도 안전하게 파싱하기 위해 grep 으로 name 추출.
+          if echo "$LABELS_JSON" | grep -q '"name":[[:space:]]*"security-spec-change"'; then
+            echo "Label 'security-spec-change' present — gate satisfied."
+          else
+            echo "::error::This PR modifies docs/security_handshake.md or docs/production_provisioning.md."
+            echo "::error::Add the 'security-spec-change' label after coordinating with Server/AI/App repos."
+            exit 1
+          fi

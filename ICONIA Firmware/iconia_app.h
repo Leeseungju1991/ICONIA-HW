@@ -14,6 +14,8 @@
 class ProvisioningServerCallbacks;
 class SsidCallbacks;
 class PasswordCallbacks;
+class CredentialCallbacks;
+class SecurityGapCallbacks;
 
 class IconiaApp {
  public:
@@ -196,6 +198,25 @@ class IconiaApp {
   bool provisioningNonceValid() const;
   void publishProvisioningNonce(BLECharacteristic* nonceCharacteristic);
 
+  // Secure handshake (docs/security_handshake.md)
+  // 본 메서드들은 kBleSecureMode==true 일 때만 의미. legacy 평문 경로는
+  // 출시 빌드에서 컴파일조차 되지 않는다.
+  bool loadSecuritySeed();
+  void zeroizeSecuritySeed();
+  bool deriveSessionKey();
+  bool processCredentialBlob(const uint8_t* blob, size_t blobLen, bool lastChunk);
+  void notifyProvStatus(const char* statusToken);
+  uint8_t deviceMac_[6] = {0};
+  uint8_t sessionNonce_[16] = {0};
+  uint8_t sessionSalt_[16] = {0};
+  uint8_t channelKey_[32] = {0};
+  bool channelKeyReady_ = false;
+  bool bonded_ = false;
+  // Credential char 와 Capability char 핸들 — secure 모드에서만 활성.
+  BLECharacteristic* bleCredentialCharacteristic_ = nullptr;
+  BLECharacteristic* bleSessionCharacteristic_ = nullptr;
+  BLECharacteristic* bleCapabilityCharacteristic_ = nullptr;
+
   NextAction runEventFlow(const WifiCredentials& creds);
 
   Preferences preferences_;
@@ -220,4 +241,6 @@ class IconiaApp {
   friend class ProvisioningServerCallbacks;
   friend class SsidCallbacks;
   friend class PasswordCallbacks;
+  friend class CredentialCallbacks;
+  friend class SecurityGapCallbacks;
 };

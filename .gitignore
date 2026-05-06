@@ -13,3 +13,29 @@ build/
 # build.sh / build.bat 가 이 파일을 매 빌드마다 덮어쓴다.
 ICONIA Firmware/build_opt.h
 build_opt.h
+
+# =============================================================================
+# 보안 자산 — 절대 commit 금지
+# =============================================================================
+# 양산 서명 키, 디바이스별 factory_nvs seed, lot CSV 등은 리포에 들어와선
+# 안 된다. CI(.github/workflows/firmware-ci.yml :: secure-boot-precondition)
+# 에서도 동일 패턴을 강제 차단한다.
+secrets/
+*.pem
+*.der
+*.key
+*.priv
+*_priv.*
+*_private.*
+
+# 양산 lot / 시리얼 / seed 묶음 CSV
+lot*.csv
+serial*.csv
+serials*.csv
+factory_seed*.csv
+
+# espsecure / espefuse 산출물
+*.signed.bin
+*.efuse.bin
+secure_boot_signing_key*
+flash_encryption_key*

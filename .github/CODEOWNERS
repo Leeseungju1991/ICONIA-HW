@@ -1,0 +1,42 @@
+# ICONIA HW 리포 CODEOWNERS
+#
+# 본 파일은 보안 정합 문서 / 빌드 프로파일 / 파티션 테이블의 변경 시
+# HW 책임자와 보안 책임자 양쪽 리뷰를 강제한다.
+#
+# 실제 GitHub username 은 추후 매핑. 현재는 placeholder 팀 핸들 사용.
+# (조직 셋업 시 @iconia-org/hw-leads, @iconia-org/security-leads 같은
+#  team handle 로 치환할 것.)
+
+# ---------------------------------------------------------------------------
+# 기본 — HW 리드가 모든 변경을 1차 리뷰
+# ---------------------------------------------------------------------------
+*                                                @hw-lead
+
+# ---------------------------------------------------------------------------
+# 보안 정합 문서 — Server/AI/App 리포 정합 깨짐 위험. HW + 보안 양쪽 강제.
+# ---------------------------------------------------------------------------
+/docs/security_handshake.md                      @hw-lead @security-lead
+/docs/production_provisioning.md                 @hw-lead @security-lead
+
+# ---------------------------------------------------------------------------
+# Prod 빌드 프로파일 — 출시 차단급 보안 잠금 매크로 정본
+# ---------------------------------------------------------------------------
+/ICONIA Firmware/build_profiles/prod.h           @hw-lead @security-lead
+
+# ---------------------------------------------------------------------------
+# Partition table — 부트로더 / OTA 슬롯 / factory_nvs 영역. 잘못 건드리면
+# secure boot V2 무효화 또는 anti-rollback eFuse 와 어긋남.
+# ---------------------------------------------------------------------------
+/ICONIA Firmware/partitions.csv                  @hw-lead @security-lead
+
+# ---------------------------------------------------------------------------
+# Security 모듈 자체 — AEAD 핸드셰이크 / factory seed 검증 코드
+# ---------------------------------------------------------------------------
+/ICONIA Firmware/iconia_security.cpp             @hw-lead @security-lead
+/ICONIA Firmware/iconia_security.h               @hw-lead @security-lead
+
+# ---------------------------------------------------------------------------
+# CI 자체 — gate 약화 시도 차단
+# ---------------------------------------------------------------------------
+/.github/workflows/                              @hw-lead @security-lead
+/.github/CODEOWNERS                              @hw-lead @security-lead

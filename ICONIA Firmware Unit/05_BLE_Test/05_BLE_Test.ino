@@ -15,7 +15,10 @@
 // 주의:
 //   - UUID, 디바이스명 prefix 모두 프로덕션 펌웨어와 동일하게 유지해야
 //     검수의 의미가 있다. 임의 변경 금지.
-//   - 본 sketch 는 본딩/암호화를 강제하지 않는다 (kBleSecureMode = false 와 동일).
+//   - 본 sketch 는 본딩/암호화를 강제하지 않는다 (legacy plaintext 검수 전용).
+//   - V1 secure handshake (docs/security_handshake.md) 검수는 본 sketch 가 아닌
+//     실제 펌웨어 (build_profiles/dev.h, ICONIA_BLE_SECURE=1) 로 수행한다.
+//     본 sketch 는 GATT Discovery / 광고 / Notify 파이프라인만 검수.
 // =============================================================================
 
 #include <Arduino.h>

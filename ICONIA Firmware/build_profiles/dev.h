@@ -110,10 +110,23 @@
 // OTA 디버그 verbosity (시리얼 로그 추가). prod 에서는 0 또는 미정의.
 #define ICONIA_OTA_DEBUG 1
 
+// dev 빌드의 디버깅 우회: factory seed burn 안 된 모듈도 BLE 광고 시작
+// 가능. 단, AEAD 핸드셰이크 자체는 secure 모드를 따른다 (앱 측 정합 검증
+// 위해). LOCKDOWN 은 정의하지 않음 → 디버그 경로(시리얼 로그, insecure
+// 폴백) 모두 사용 가능.
+
+// secure 모드 기본 활성. dev 는 평문 모드 우회 디버깅 시에만 0 으로 override.
+//   #define ICONIA_BLE_SECURE 0   // bring-up fixture 검수 외 금지
+#define ICONIA_BLE_SECURE 1
+
+// dev 빌드는 factory seed 부재 허용. RELEASE 출하는 절대 0 으로 두지 말 것.
+#define ICONIA_REQUIRE_FACTORY_SEED 0
+
 // 다음 매크로들은 dev 에서 의도적으로 미정의 — iconia_config.h 의 #else 분기로
 // 안전 기본값(false / "" / 통상값) 적용된다.
 //   ICONIA_CERT_FP_SHA1        : 핀닝 비활성 (CA bundle 만 사용)
 //   ICONIA_ALLOW_INSECURE_TLS  : 항상 TLS 검증
 //   ICONIA_ALLOW_INSECURE_OTA  : OTA root CA 부재 시 차단
-//   ICONIA_BLE_SECURE          : Just Works 평문 페어링 (앱 호환)
 //   ICONIA_PRODUCTION_BUILD    : 시리얼 로그 ON (bring-up)
+//   ICONIA_LOCKDOWN            : OFF — 디버그 경로 / Insecure 폴백 우회 가능
+//   ICONIA_SECURE_VERSION      : 미정의 (= 1, anti-rollback 베이스라인)

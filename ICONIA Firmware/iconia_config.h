@@ -158,26 +158,109 @@ static constexpr const char* kServerCertFingerprintSha1 = "";
 #endif
 
 // -----------------------------------------------------------------------------
-// BLE Secure provisioning (opt-in)
+// BLE Secure provisioning (출시 차단급 보안 — 정본: docs/security_handshake.md)
 // -----------------------------------------------------------------------------
-// When enabled, the SSID/password characteristics require an encrypted MITM-
-// protected link (Just Works secure connections, ESP_LE_AUTH_REQ_SC_MITM_BOND).
-// Default is OFF because the current RN app pairs without bonding; flipping
-// this on without a coordinated app update breaks first-time setup.
+// v1 출하부터 secure mode 가 **기본값**(true). legacy 평문 GATT(Just Works
+// 본딩 없이 SSID/PW 평문 write) 경로는 펌웨어에서 컴파일조차 되지 않는다.
+// dev 빌드도 동일 secure 경로 사용하되, 디버그 로그/가드 완화는 별도 매크로
+// (ICONIA_PRODUCTION_BUILD) 로만 차이를 둔다.
 //
-// Enable after rn-mobile aligns the pairing UX:
-//   -DICONIA_BLE_SECURE=1
+// 호환성: 본 secure 모드는 **hard cut-over**. 구버전 평문 페어링 앱은
+// 동작하지 않는다. RN 앱 측은 docs/security_handshake.md §6 의 시퀀스대로
+// 페어링 → Session read → Credential write (AEAD) 경로로 마이그레이션.
+//
+// disable override (bring-up 한정):
+//   -DICONIA_BLE_SECURE=0     // 평문 경로 컴파일 (디버그 fixture 검수 외 금지)
 // -----------------------------------------------------------------------------
 #ifdef ICONIA_BLE_SECURE
 static constexpr bool kBleSecureMode = (ICONIA_BLE_SECURE != 0);
 #else
-static constexpr bool kBleSecureMode = false;
+static constexpr bool kBleSecureMode = true;
 #endif
 
-// Provisioning nonce TTL (matches the 2-min advertising window). The app must
-// echo back the current nonce inside the SSID payload (or a dedicated char)
-// once secure mode is on; replays beyond this window are rejected.
-static constexpr uint32_t kBleNonceTtlMs = 120000;
+// 본 secure 핸드셰이크의 최대 광고 윈도우. legacy kProvisioningTimeoutMs 와
+// 동일 (2 분) — security_handshake.md §6.
+static constexpr uint32_t kBleSessionTtlMs = 120000;
+
+// 청크 누적 타임아웃 (security_handshake.md §4 step 4).
+static constexpr uint32_t kBleChunkAccumTimeoutMs = 30000;
+
+// AEAD ts_unix 와 디바이스 millis 기반 단조 카운터의 허용 편차(초).
+// (security_handshake.md §4 step 5 — ±10분)
+static constexpr int32_t kBleTsWindowSec = 600;
+
+// 본딩/검증 실패 시 다음 시도까지 백오프 테이블 (ms).
+// security_handshake.md §5.2.
+static constexpr uint32_t kProvBackoffMs[] = {
+  /*fail#1*/  1000u,
+  /*fail#2*/  4000u,
+  /*fail#3*/ 16000u,
+  /*fail#4*/ 60000u,
+  /*fail#5+*/60000u,
+};
+static constexpr size_t kProvBackoffSlots = sizeof(kProvBackoffMs) / sizeof(uint32_t);
+
+// 12 시간 윈도우 안에 누적 본딩/검증 실패가 이 값 이상이면 hard lockout.
+static constexpr uint16_t kProvHardLockoutCount = 20;
+static constexpr uint64_t kProvLockoutWindowUs = 12ULL * 60ULL * 60ULL * 1000ULL * 1000ULL;
+
+// Replay cache slot 수 (RTC slow-mem). 각 slot 은 8B truncated SHA-256.
+// security_handshake.md §5.1.
+static constexpr size_t kProvReplayCacheSlots = 16;
+
+// Secure mode characteristic UUIDs (security_handshake.md §2.2).
+// legacy SSID(...e1)/Password(...e2)/legacy Nonce(...e4) 는 secure 빌드에서
+// 사용하지 않으며 GATT 등록도 하지 않는다.
+static constexpr const char* kBleStatusCharUuidV1     = "48f1f79e-817d-4105-a96f-4e2d2d6031e3";
+static constexpr const char* kBleCapabilityCharUuid   = "48f1f79e-817d-4105-a96f-4e2d2d6031e5";
+static constexpr const char* kBleSessionCharUuid      = "48f1f79e-817d-4105-a96f-4e2d2d6031e6";
+static constexpr const char* kBleCredentialCharUuid   = "48f1f79e-817d-4105-a96f-4e2d2d6031e7";
+
+// factory NVS namespace (read-only at runtime). 양산 라인 burn 절차는
+// docs/production_provisioning.md §3 Step 6.
+static constexpr const char* kFactoryNvsNamespace = "factory";
+static constexpr const char* kFactoryKeySeed      = "seed";       // 32B BLOB
+static constexpr const char* kFactoryKeySeedSalt  = "seed_salt";  // 16B BLOB
+static constexpr const char* kFactoryKeyProductId = "pid";        // string
+static constexpr const char* kFactoryKeyMfgDate   = "mfg_date";   // string
+static constexpr const char* kFactoryKeySeedVer   = "seed_ver";   // uint8
+
+static constexpr size_t kFactorySeedLen = 32;
+static constexpr size_t kFactorySeedSaltLen = 16;
+
+// factory seed 부재 시 부팅 거부. RELEASE 빌드는 절대 비활성 금지.
+// dev/bring-up 에서 factory burn 안 된 모듈로 동작 시키려면 명시적 override:
+//   -DICONIA_REQUIRE_FACTORY_SEED=0
+#ifdef ICONIA_REQUIRE_FACTORY_SEED
+static constexpr bool kRequireFactorySeed = (ICONIA_REQUIRE_FACTORY_SEED != 0);
+#else
+static constexpr bool kRequireFactorySeed = true;
+#endif
+
+// -----------------------------------------------------------------------------
+// LOCKDOWN — 출하 잠금 통합 가드
+// -----------------------------------------------------------------------------
+// `ICONIA_LOCKDOWN=1` 이면 다음을 모두 강제:
+//   - factory seed 부재 시 boot 거부 (= kRequireFactorySeed=true 와 동일하게 강제)
+//   - secure BLE 비활성 override 거부 (kBleSecureMode 강제 true)
+//   - OTA 시 anti-rollback 검사 활성 (esp_efuse_check_secure_version)
+//   - Insecure TLS / Insecure OTA override 무시 (false 강제)
+// 이 매크로는 PROD 빌드에서만 정의되며, DEV 빌드는 미정의 → 디버그 우회 가능.
+#ifdef ICONIA_LOCKDOWN
+static constexpr bool kLockdown = (ICONIA_LOCKDOWN != 0);
+#else
+static constexpr bool kLockdown = false;
+#endif
+
+// anti-rollback 펌웨어 보안 버전. esp_efuse_check_secure_version 으로 검사.
+// 단조 증가만 허용. 펌웨어 보안 패치 출시 시 이 값을 +1 → 새 펌웨어가 첫
+// 부팅에서 eFuse SECURE_VERSION 을 단조 증가 burn (ESP-IDF 자동) → 이후 구
+// 펌웨어는 부팅 거부. 양산 디바이스에 burn 되는 초기값은 1.
+#ifdef ICONIA_SECURE_VERSION
+static constexpr uint32_t kSecureVersion = (ICONIA_SECURE_VERSION);
+#else
+static constexpr uint32_t kSecureVersion = 1;
+#endif
 
 // -----------------------------------------------------------------------------
 // Production logging

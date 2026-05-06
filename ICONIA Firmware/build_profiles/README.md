@@ -15,8 +15,11 @@
 | `ICONIA_CERT_FP_SHA1` | leaf 인증서 SHA-1 핀닝 | (미정의) | (미정의 — 운영 시 결정) |
 | `ICONIA_ALLOW_INSECURE_TLS` | TLS 검증 비활성 (bring-up only) | (미정의) | **절대 정의 금지** |
 | `ICONIA_ALLOW_INSECURE_OTA` | OTA root CA 부재 시 setInsecure 폴백 | (미정의) | **절대 정의 금지** |
-| `ICONIA_BLE_SECURE` | BLE Just Works MITM 본딩 활성 | (미정의 — 평문) | (미정의 — 운영 출하 직전 `1` 권장) |
-| `ICONIA_PRODUCTION_BUILD` | 시리얼 로그 OFF | (미정의 — bring-up) | (미정의 — 운영 출하 직전 `1` 권장) |
+| `ICONIA_BLE_SECURE` | BLE 본딩 + AEAD secure 핸드셰이크 강제 (정본: docs/security_handshake.md) | `1` | `1` *(필수)* |
+| `ICONIA_PRODUCTION_BUILD` | 시리얼 로그 OFF | (미정의 — bring-up) | `1` *(필수)* |
+| `ICONIA_REQUIRE_FACTORY_SEED` | factory_nvs seed 부재 시 부팅 거부 | `0` (bring-up 모듈 허용) | `1` *(필수)* |
+| `ICONIA_LOCKDOWN` | anti-rollback / Insecure 폴백 차단 통합 가드 | (미정의) | `1` *(필수)* |
+| `ICONIA_SECURE_VERSION` | 펌웨어 보안 버전 (eFuse 단조 증가) | (미정의 = 1) | `1` *(보안 패치 시 +1)* |
 
 ## CA PEM 처리 정책
 
@@ -40,9 +43,10 @@ dev/prod 양쪽 모두 **ISRG Root X1 + Amazon Root CA 1 두 개를 cert chain b
 2. `ICONIA_API_ENDPOINT` 의 `ICONIA_PROD_DOMAIN_PLACEHOLDER` 를 실제 운영 도메인으로 교체
    - 예: `https://api.iconia.example-corp.com/api/event`
 3. `ICONIA_API_KEY` 의 `PROD_API_KEY_PLACEHOLDER` 를 실제 운영 API key 로 교체
-4. (출하 직전) 다음 두 매크로 정의 추가 검토
-   - `#define ICONIA_PRODUCTION_BUILD 1`
-   - `#define ICONIA_BLE_SECURE 1`
+4. 보안 잠금 매크로 5종은 prod.h 에 이미 정의되어 있고 `build.sh prod` /
+   `build.bat prod` 가 컴파일 전 자체 검증한다. 임의로 주석 처리하면 빌드 거부.
+5. 양산 라인 절차: `HW/docs/production_provisioning.md` §3 참조 (Secure Boot
+   서명, Flash Encryption, JTAG/UART download disable, factory seed burn).
 
 ## placeholder 와 부팅 가드의 관계
 

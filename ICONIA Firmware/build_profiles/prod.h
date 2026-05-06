@@ -111,14 +111,52 @@
 // 운영은 OTA 디버그 로그 OFF.
 #define ICONIA_OTA_DEBUG 0
 
-// 다음 매크로들은 prod 에서 의도적으로 미정의 — iconia_config.h 의 #else 분기로
-// 안전 기본값 적용:
+// =============================================================================
+// 출시 차단급 보안 잠금 (모두 강제 활성)
+// =============================================================================
+// 본 매크로들은 prod 빌드에서 절대 비활성화하지 말 것. 비활성 빌드를 출하한
+// 디바이스는 출시 차단 사유.
+//
+// dev/bring-up 빌드 (build_profiles/dev.h) 는 본 섹션의 매크로를 의도적으로
+// 정의하지 않아 디버깅 가능 상태 유지. 정본 운영 가이드: docs/security_handshake.md,
+// docs/production_provisioning.md.
+
+// 1. 시리얼 로그 차단 — UART 노출되는 SSID/IP/명령 스트림 누설 차단.
+#define ICONIA_PRODUCTION_BUILD 1
+
+// 2. BLE secure 핸드셰이크 강제 — 본딩 + AES-256-GCM AEAD 만 허용.
+//    legacy 평문 SSID/PW characteristic 은 컴파일조차 안 됨.
+#define ICONIA_BLE_SECURE 1
+
+// 3. factory_nvs (RO) 시드 부재 시 부팅 거부.
+//    양산 라인은 docs/production_provisioning.md §3 Step 6 의 burn 절차 필수.
+#define ICONIA_REQUIRE_FACTORY_SEED 1
+
+// 4. anti-rollback / OTA 서명 검증 / Insecure 폴백 전부 차단 통합 가드.
+#define ICONIA_LOCKDOWN 1
+
+// 5. 펌웨어 secure_version. 보안 패치 출시 시 +1.
+//    eFuse SECURE_VERSION 은 첫 부팅에서 ESP-IDF 가 자동 단조 증가 burn —
+//    이후 작은 값을 가진 구 펌웨어는 부트로더에서 거부됨.
+#define ICONIA_SECURE_VERSION 1
+
+// =============================================================================
+// 다음은 prod 에서 의도적으로 미정의 — iconia_config.h 의 #else 분기 적용:
 //   ICONIA_CERT_FP_SHA1        : 미정의 (운영 시 leaf SHA-1 결정 후 활성화 검토)
 //   ICONIA_ALLOW_INSECURE_TLS  : 절대 정의 금지 (TLS 검증 항상 ON)
 //   ICONIA_ALLOW_INSECURE_OTA  : 절대 정의 금지 (OTA root CA 부재 시 차단)
-//   ICONIA_BLE_SECURE          : 운영 시 1 로 활성 검토 (앱 호환 합의 후)
-//   ICONIA_PRODUCTION_BUILD    : 운영 시 1 로 활성 검토 (시리얼 로그 OFF)
 //
-// 운영 출하 직전에 다음 두 매크로 추가 정의를 권장:
-//   #define ICONIA_PRODUCTION_BUILD 1
-//   #define ICONIA_BLE_SECURE       1
+// =============================================================================
+// 빌드 후 양산 라인 burn 절차 (정본: docs/production_provisioning.md §3)
+// =============================================================================
+// Step 2:  signed bootloader/partition/app flash
+// Step 3:  espefuse.py burn_key_digest + SECURE_BOOT_EN=1
+// Step 4:  espefuse.py FLASH_CRYPT_CNT=0xF (RELEASE flash encryption)
+// Step 5:  espefuse.py JTAG_DISABLE=1, UART_DOWNLOAD_DIS=1
+// Step 6:  factory_nvs seed/salt/seed_ver burn
+// Step 7:  첫 부팅 → ESP-IDF 가 SECURE_VERSION 자동 burn (anti-rollback)
+// Step 8:  QA 검증 (페어링, status notify, deep sleep 전류, 터치 wake)
+//
+// 본 build profile 자체로는 위 eFuse burn 을 수행하지 않는다 (서명 키가 빌드
+// 환경에 노출되지 않도록 의도적 분리). build.sh prod 는 unsigned binary 만
+// 산출 → 라인 fixture 가 별도 sign + burn.

@@ -47,15 +47,29 @@ ICONIA AI 인형(ESP32 기반 IoT 제품, **성인 사용자 한정**)의 펌웨
 - 5% 미만이면 촬영·전송 생략 후 즉시 Deep Sleep 복귀
 - 캡처 해상도: VGA / JPEG quality 12 (PSRAM 없으면 quality 14)
 
-### BLE GATT 서비스
+### BLE GATT 서비스 (V1 secure handshake)
 - 서비스 UUID `48f1f79e-817d-4105-a96f-4e2d2d6031e0`
-  - `...e1` SSID — Write Without Response
-  - `...e2` Password — Write Without Response
-  - `...e3` Status — Notify / Read
+  - `...e3` Status — Notify / Read (READ_ENC_MITM)
+  - `...e5` Capability — Read (no auth, 32B 메타)
+  - `...e6` Session — Read (READ_ENC_MITM, 16B nonce + 16B salt)
+  - `...e7` Credential — Write (WRITE_ENC_MITM, AES-256-GCM AEAD blob)
+- 본딩: `ESP_LE_AUTH_REQ_SC_MITM_BOND` 강제. legacy `...e1`/`...e2` 평문 SSID/PW
+  특성은 secure 빌드에서 **GATT 등록조차 하지 않는다**.
+- 정본 스펙: [`docs/security_handshake.md`](./docs/security_handshake.md)
 
 ### NVS 네임스페이스
-- `iconia` 네임스페이스에 `wifi_ssid`, `wifi_pw` 저장
-- 자격증명은 BLE 프로비저닝으로만 주입 (소스 / 커밋 금지)
+- `iconia` 네임스페이스: `wifi_ssid`, `wifi_pw`, OTA 보고 페어 등
+- `factory` 네임스페이스 (RO at runtime): `seed`(32B), `seed_salt`(16B),
+  `pid`, `mfg_date`, `seed_ver`. 양산 라인에서만 burn — 정본 절차:
+  [`docs/production_provisioning.md`](./docs/production_provisioning.md)
+- 자격증명은 BLE secure handshake 로만 주입 (소스 / 커밋 금지)
+
+### 출시 잠금 빌드 (`./build.sh prod`)
+- Secure Boot V2 + Flash Encryption + JTAG/UART download disable + anti-rollback
+  + factory seed 가드를 **모두** 강제. 미달 빌드는 prod 매크로 정합성 검사에서
+  거부 (`build.sh` 가 자체 차단).
+- prod 빌드 산출물은 unsigned — 양산 라인 fixture 가 sign + eFuse burn 별도 수행
+  (서명 키 빌드 환경 노출 방지).
 
 ---
 
