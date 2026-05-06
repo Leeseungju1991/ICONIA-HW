@@ -140,6 +140,22 @@
 //    이후 작은 값을 가진 구 펌웨어는 부트로더에서 거부됨.
 #define ICONIA_SECURE_VERSION 1
 
+// -----------------------------------------------------------------------------
+// 호환성 매트릭스 (server api_version 닫힌 구간) — 정본 iconia_compat.h
+// -----------------------------------------------------------------------------
+// 운영 펌웨어가 호환되는 server api_version 의 [min, max] 닫힌 구간. 부팅 후
+// health endpoint 응답의 api_version 필드와 대조하여 미호환 시 자기보호
+// 모드 진입 (이벤트 업로드 보류, BLE 진단 채널만 활성).
+//
+// 운영 정책 — prod 매트릭스는 dev 보다 보수적:
+//   server v1 = legacy 베이스라인 (호환 유지)
+//   server v2 = ota-status + cohort 점진 배포 (현 작업 라운드)
+// 운영 디바이스 max 는 검증 통과한 server 버전까지로 한정. dev 매트릭스
+// (max=3) 가 새 server 버전을 통과시키면, 그 후 다음 OTA 라운드에서 prod
+// max 를 +1 (kSecureVersion 도 함께 +1).
+#define ICONIA_COMPAT_SERVER_API_MIN 1u
+#define ICONIA_COMPAT_SERVER_API_MAX 2u
+
 // =============================================================================
 // 다음은 prod 에서 의도적으로 미정의 — iconia_config.h 의 #else 분기 적용:
 //   ICONIA_CERT_FP_SHA1        : 미정의 (운영 시 leaf SHA-1 결정 후 활성화 검토)

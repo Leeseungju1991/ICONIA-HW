@@ -224,8 +224,171 @@ boot_invariant_recorded_ms  : 정수 ms
 
 ---
 
+## 7. OTA 단계별 telemetry + post-boot smoke check + 자동 롤백
+
+본 절의 정본 구현은 `iconia_ota.{h,cpp}`. 매트릭스 셀프 체크는
+`iconia_compat.{h,cpp}`. 단계별 record 는 RTC slow-mem 큐(capacity 5)
+에 보존되어, 네트워크 단절 시에도 다음 부팅의 첫 업로드 직후에 일괄
+flush 가능. 실제 HTTPS POST `/api/v1/devices/:id/ota-status` 의 페이로드
+스키마는 server 도메인이 정의 — 본 펌웨어는 record 적재만 책임.
+
+### 7.1 7-단계 stage 라벨
+
+| stage | enum | 발생 시점 | 핵심 필드 |
+|------|------|------|------|
+| 0 | `manifest_received` | `canEnterOta` 통과 + `performOta` 진입 직후 | deployment_id, target fw_ver, target_secure_version |
+| 1 | `downloading` | `esp_https_ota_perform` 청크 루프, 1초 sampling | bytes_done / bytes_total, attempt_no, wifi_rssi, battery_mv |
+| 2 | `download_complete` | 자체 SHA-256 mmap 검증 직후 | sha_match (true/false) |
+| 3 | `applying` | `esp_https_ota_finish` 직전 (partition swap 직전) | — |
+| 4 | `post_boot_health_pending` | 새 펌웨어 첫 부팅 — `running.state == PENDING_VERIFY` 감지 시 | smoke_attempt_no |
+| 5 | `post_boot_health_ok` | smoke check 4항목 모두 통과 → `esp_ota_mark_app_valid_cancel_rollback` 호출 후 | smokeAccumMask |
+| 6 | `post_boot_health_fail` | smoke check 누적 attempt N 도달 + 일부 항목 누락 → 자동 롤백 트리거 직전 | smokeFailMask (누락 비트) |
+| 7 | `rolled_back` | 이전 partition 으로 복귀 후 정상 부팅 → `detectRollbackOnBoot` 가 INVALID/ABORTED 감지 | fwVerThatDied |
+
+추가 보조 emit:
+- `manifest_rejected` (stage=0, reason hash 동봉) — `canEnterOta` 의 downgrade /
+  sha 형식 / version 형식 거절 시. anti-rollback 매니페스트 위반도 동일 경로.
+
+### 7.2 post-boot smoke check 4항목
+
+| 비트 | SmokeBit | 검사 | 호출 위치 |
+|------|----------|------|----------|
+| `0x0001` | `kSmokeBitBootInvariant`   | `iconia_boot_check::runAll().pass` | begin() boot_check 직후 |
+| `0x0002` | `kSmokeBitFactoryNvs`      | factory seed valid | begin() factory seed 검증 직후 |
+| `0x0004` | `kSmokeBitCameraInit`      | 1회 camera init + capture 성공 | runEventFlow() captureImage 직후 |
+| `0x0008` | `kSmokeBitWifiHandshake`   | 1회 Wi-Fi 연결 + 서버 200 응답 | runEventFlow() uploadResult.success 직후 |
+
+`finalizeIfPending`:
+- 4비트 모두 set → `esp_ota_mark_app_valid_cancel_rollback` + stage 5 emit + smoke 누적 zeroize.
+- attempt_no >= `kSmokeMaxAttempts` (3) + 일부 비트 누락 → `esp_ota_mark_app_invalid_rollback_and_reboot` + stage 6 emit + ESP.restart.
+- 그 외 (attempt 1~2 + 일부 누락) → 누적 mask 보존 + deep sleep → 다음 wake 가 같은 cycle 재시도.
+
+attempt 한계 3회의 근거:
+- 1회로 끊으면 양산 라인 첫 페어링 환경에서 사용자가 Wi-Fi AP 를 켜기 전에 도달한 첫 wake 가 무조건 롤백 → false-positive.
+- 무한 허용 시 정상 부팅 안 되는 펌웨어가 영원히 OTA 슬롯 점유.
+- 3회 = 사용자 행동 (페어링 후 첫 터치) 의 리트라이 윈도우 + 충분한 하드 컷.
+
+### 7.3 자동 롤백 안전 시퀀스
+
+```
+[새 펌웨어 부팅]
+  ├─ ota::onBoot()                       // PENDING_VERIFY 감지 + attempt++
+  │     └─ telemetry stage 4 (pending)
+  ├─ ota::markBootInvariantOk()          // boot_check 통과 시
+  ├─ ota::markFactoryOk()                // factory seed 통과 시
+  ├─ runEventFlow()
+  │     ├─ ota::markCameraInitOk()       // capture 성공 시
+  │     └─ ota::markWifiHandshakeOk()    // 200 응답 후
+  └─ ota::finalizeIfPending()
+        │
+        ├─ all-OK   → mark_app_valid + telemetry stage 5  → 이후 일반 boot
+        │
+        ├─ attempt < 3 + 일부 누락
+        │             → 누적 mask 보존 + deep sleep
+        │             → 다음 wake 에서 같은 cycle 진입 (s_smokeAttemptNo++)
+        │
+        └─ attempt >= 3 + 일부 누락
+              → telemetry stage 6 (failMask)
+              → esp_ota_mark_app_invalid_rollback_and_reboot
+              → 부트로더가 이전 partition 의 valid 슬롯 선택
+              → ESP.restart
+              [이전 partition 부팅]
+              ├─ detectRollbackOnBoot() 가 INVALID/ABORTED 감지
+              │     └─ recordOtaResult(rolled_back, prevVersion)
+              │     └─ ota::onRolledBack(prevVersion)  → telemetry stage 7
+              └─ 이후 일반 boot 흐름 — factory_nvs / events_q / replay cache /
+                 NVS Wi-Fi 자격증명 모두 그대로 보존 (사용자 데이터 손실 없음).
+```
+
+### 7.4 secure_version anti-rollback 정합
+
+본 자동 롤백 시퀀스는 anti-rollback eFuse 를 절대 후퇴시키지 않는다:
+
+- 신규 펌웨어가 `kSecureVersion` 을 +1 하지 않은 빌드 (= 보안 패치 외 일반
+  feature 릴리스) 일 때만 롤백 가능. 이전 partition 의 secure_version 이
+  현재 burn 된 eFuse 와 같으므로 부트로더가 통과시킴.
+- 신규 펌웨어가 `kSecureVersion` 을 +1 한 경우, 부팅 자체에 성공했다는 것은
+  이미 eFuse SECURE_VERSION 이 자동 burn (단조 증가) 되었음을 의미.
+  이 상태에서 이전 partition 으로 복귀하면 부트로더가 거절 → 부팅 실패.
+  → 이 시나리오는 **펌웨어가 절대 발생시키면 안 된다**. 매니페스트 가드:
+  - 서버 매니페스트 `target_secure_version` <= 펌웨어 현재 `kSecureVersion`
+    → `iconia_compat::checkManifestSecureVersion` false → 거절 (sha mismatch
+    경로 동등). `manifest_rejected` telemetry emit.
+  - server 측은 cohort 점진 배포 시 secure_version 후퇴 매니페스트를 절대
+    발급하지 않는다 (sliding window 롤백 정책에서도).
+- 결론: 펌웨어 측 자동 롤백은 "secure_version 동일 펌웨어의 자가점검
+  실패" 만 처리. eFuse 는 절대 후퇴 시도 X.
+
+### 7.5 sliding window 롤백 정책과의 정합
+
+server 측 cohort 기반 sliding window 롤백 정책 (1% → 5% → 25% → 100% 같은
+점진 배포 + 임계 실패율 도달 시 즉시 stop):
+
+- 펌웨어 stage 6 (`post_boot_health_fail`) 비율이 cohort 임계치 초과 시
+  server 가 cohort 진척 stop + 미배포 디바이스에 매니페스트 배포 중지.
+- 이미 OTA 받은 디바이스는 펌웨어 자체 자동 롤백이 stage 7 emit → server
+  가 deployment_id 별 rolled_back 카운터 누적.
+- server 가 별도 "force rollback" 명령 (= 더 낮은 fw_ver 매니페스트 강제
+  배포) 을 보낼 때는 secure_version 후퇴 금지 정책 위반이므로 **절대 X**.
+  대신 새 hotfix 릴리스 (fw_ver 더 높음, secure_version 같음 또는 +1) 로
+  로 forward-roll.
+
+### 7.6 호환성 매트릭스 셀프 체크
+
+`iconia_compat::evaluate(observedServerApiVersion)`:
+
+- 빌드 시점에 `build_profiles/{dev,prod}.h` 에 박힌 `kCompatServerApiMin` /
+  `kCompatServerApiMax` 닫힌 구간과 server `health` endpoint 응답의
+  `api_version` 정수 비교.
+- `Compatible`: 정상 동작.
+- `Incompatible`: 이벤트 업로드 보류 + BLE 진단 채널만 활성 (본 라운드는
+  진단 char 미추가 — 정의만 동결, §2.5 와 동일).
+- `Unknown`: health 응답 미수신 시 fallback. 이전 cycle cached verdict 가
+  있으면 그것을 신뢰, 없으면 잠정 Compatible (신규 양산 디바이스의 첫
+  health 응답 도달 전 영영 lockout 방지).
+
+server v1 / v2 정합 (현 라운드):
+- v1 = legacy `/api/event` 만, ota-status endpoint 없음.
+- v2 = ota-status endpoint + cohort 점진 배포 + 매트릭스 동결.
+
+dev 매트릭스: `[1, 3]` (선행 검증 가능 윈도우). prod 매트릭스: `[1, 2]`
+(검증 통과한 server 버전까지만). server 가 v3 으로 올라갈 때는 dev
+빌드로 통합 검증 후 OTA 라운드에 prod max 를 +1 하여 배포.
+
+### 7.7 manifest 정합 검증 (펌웨어 측)
+
+| 검증 | 위치 | 실패 시 |
+|------|------|--------|
+| URL prefix `https://` | `canEnterOta::stringStartsWithHttps` | 거절, 시리얼 로그 |
+| sha256 64 lower-hex | `canEnterOta::hexStringIsLowerSha256` | 거절, 시리얼 로그 |
+| version strict semver | `canEnterOta::parseSemver` | `version_rejected` + `manifest_rejected` telemetry |
+| 다운그레이드 차단 | `canEnterOta::compareSemver` | `version_rejected` + `manifest_rejected` telemetry |
+| anti-rollback (target_secure_version > 현재) | `iconia_compat::checkManifestSecureVersion` (server 헤더 합의 후 활성) | `manifest_rejected` telemetry |
+| 다운로드 sha 일치 | `performOta` 의 mmap + mbedtls_sha256 | `sha_mismatch` enum + `download_complete(false)` telemetry |
+| Secure Boot V2 chain | IDF 기본 (`esp_https_ota_finish` 가 검증 실패 시 ESP_ERR_OTA_VALIDATE_FAILED) | `flash_failed` enum |
+
+### 7.8 RTC slow-mem 큐
+
+| 항목 | 위치 | 용량 |
+|------|------|------|
+| `s_queue[5]` | iconia_ota | 5 × ~32B = 160B |
+| `s_smokeAccumMask`, `s_smokeAttemptNo` | iconia_ota | 4B |
+| `s_currentDeploymentIdHash` 외 5개 | iconia_ota | 24B |
+| `s_cachedVerdict` | iconia_compat | 12B |
+
+총 ~200B. §5 의 기존 사용량과 합산하여 8KB 한계 대비 여유 충분.
+
+---
+
 ## 6. 변경 이력
 
 - v1 (2026-05-06): 초안. 본 라운드 신설 — Wi-Fi 백오프 jitter, persistent queue,
   배터리 다단계 임계 + dV/dt 가드, prod boot invariant 검사. 서버 합의가
   필요한 telemetry 필드 추가는 별도 라운드 (`integration-reviewer`).
+- v2 (2026-05-06): §7 추가 — OTA 7-stage telemetry, post-boot smoke check 4항목,
+  자동 롤백 시퀀스, secure_version anti-rollback 정합, sliding window 롤백
+  정책, 호환성 매트릭스 셀프 체크, manifest 정합 검증. 정본 구현은
+  `iconia_ota.{h,cpp}` + `iconia_compat.{h,cpp}`. server `/api/v1/devices/:id/ota-status`
+  endpoint 페이로드 스키마는 server 도메인이 정의 (라운드 진행 중).
+  본 펌웨어는 RTC slow-mem 큐 적재까지만 책임 — 실제 HTTPS POST 전송
+  본체는 다음 라운드 server 합의 후 추가.

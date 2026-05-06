@@ -130,3 +130,18 @@
 //   ICONIA_PRODUCTION_BUILD    : 시리얼 로그 ON (bring-up)
 //   ICONIA_LOCKDOWN            : OFF — 디버그 경로 / Insecure 폴백 우회 가능
 //   ICONIA_SECURE_VERSION      : 미정의 (= 1, anti-rollback 베이스라인)
+
+// -----------------------------------------------------------------------------
+// 호환성 매트릭스 (server api_version 닫힌 구간) — 정본 iconia_compat.h
+// -----------------------------------------------------------------------------
+// 펌웨어가 호환되는 server api_version 의 [min, max] 닫힌 구간. 부팅 후
+// health endpoint 응답의 api_version 필드와 대조하여 미호환 시 자기보호
+// 모드 진입.
+//
+// 매트릭스 정합:
+//   server v1 = ota-status 미지원 (legacy /api/event 만)
+//   server v2 = ota-status + cohort 점진 배포 (현 작업 라운드)
+// dev 빌드는 server 가 더 빠르게 변경되므로 max 를 prod 보다 1 높게 잡아
+// 사전 검증 가능 윈도우 확보.
+#define ICONIA_COMPAT_SERVER_API_MIN 1u
+#define ICONIA_COMPAT_SERVER_API_MAX 3u

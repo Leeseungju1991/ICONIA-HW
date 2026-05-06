@@ -29,6 +29,8 @@
 #include "iconia_protocol.h"
 #include "iconia_security.h"
 #include "iconia_boot_check.h"
+#include "iconia_ota.h"
+#include "iconia_compat.h"
 
 IconiaApp* gAppInstance = nullptr;
 
@@ -232,7 +234,17 @@ void IconiaApp::begin() {
       iconia::boot_check::recordPanicLog(br.violationMask);
       iconia::boot_check::haltForever();  // [[noreturn]]
     }
+    // OTA post-boot smoke check: boot invariant 통과 신호 mark.
+    // pending_verify 가 아니면 mark 호출은 no-op.
+    iconia::ota::markBootInvariantOk();
   }
+
+  // -------------------------------------------------------------------------
+  // OTA post-boot smoke check 사이클 시작 (정본: docs/operational_telemetry.md §7).
+  // 새 펌웨어 첫 부팅 시 (running partition state == PENDING_VERIFY) 만 의미.
+  // 일반 boot 에서는 즉시 반환 + 잔여 smoke 누적 상태 zeroize.
+  // -------------------------------------------------------------------------
+  iconia::ota::onBoot();
 
   // anti-rollback: ESP-IDF 가 부트로더 단계에서 eFuse SECURE_VERSION 과
   // 펌웨어 헤더의 secure_version 을 자동 비교하므로, 이 시점에 부팅 성공
@@ -258,6 +270,13 @@ void IconiaApp::begin() {
       esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
       esp_deep_sleep_start();
     }
+    // OTA smoke check: factory_nvs 정상 마운트 + seed valid 신호 mark.
+    iconia::ota::markFactoryOk();
+  } else {
+    // dev 빌드 (factory seed 검사 우회) 경로에서도 smoke 단계는 "no-op pass"
+    // 로 취급하여 mark — pending_verify 부팅이라면 dev 환경에서도 OTA 확정
+    // 흐름 동일하게 검증 가능.
+    iconia::ota::markFactoryOk();
   }
 
   // OTA 자가점검 안내 로그. 실제 mark는 첫 정상 업로드 성공 직후 호출.
@@ -1668,6 +1687,8 @@ IconiaApp::NextAction IconiaApp::runEventFlow(const WifiCredentials& creds) {
   if (frame == nullptr) {
     return NextAction::None;
   }
+  // OTA smoke check: 카메라 init + 1회 capture 성공 신호 mark.
+  iconia::ota::markCameraInitOk();
 
   if (!connectToWifiWithRetry(creds, iconia::config::kWifiRetryCount)) {
     esp_camera_fb_return(frame);
@@ -1697,8 +1718,15 @@ IconiaApp::NextAction IconiaApp::runEventFlow(const WifiCredentials& creds) {
   // 자가 점검: "Wi-Fi 연결 + 서버 200 응답 1회 성공" 정의.
   // pending_verify 파티션이라면 이 시점에서 mark_app_valid_cancel_rollback.
   // 일반 부팅(이미 valid)일 때는 no-op.
+  //
+  // 본 라운드부터는 markAppValidIfPending (legacy 단일 신호) 와 더불어
+  // iconia::ota 의 4-항목 smoke check 도 함께 수행. 4개 모두 통과해야 정밀
+  // OTA 확정 telemetry (post_boot_health_ok) 가 emit 된다. 한 항목이라도
+  // 누락 + attempt 한계 도달 시 자동 롤백 (esp_ota_mark_app_invalid_rollback_and_reboot).
   if (uploadResult.success) {
+    iconia::ota::markWifiHandshakeOk();
     markAppValidIfPending();
+    iconia::ota::finalizeIfPending();
   }
 
   if (uploadResult.success && uploadResult.nextAction == NextAction::Ota) {
@@ -1823,8 +1851,23 @@ bool IconiaApp::canEnterOta(const OtaCommand& ota, int batteryPercent, int rssiD
     logLine(String("[OTA-GUARD] version_downgrade_blocked: current=") +
             iconia::config::kFirmwareVersion + " incoming=" + ota.version);
     recordOtaResult(iconia::protocol::kOtaResultVersionRejected, ota.version.c_str());
+    iconia::ota::onManifestRejected("version_downgrade", ota.version.c_str(),
+                                    iconia::config::kSecureVersion);
     return false;
   }
+
+  // anti-rollback 매니페스트 정합 (정본: docs/operational_telemetry.md §7.2).
+  // 서버가 X-OTA-Secure-Version 헤더로 매니페스트 target_secure_version 을
+  // 동봉하기 시작하면, 본 자리에서 iconia_compat::checkManifestSecureVersion
+  // 으로 사전 차단. 본 라운드는 헤더 미합의 — 펌웨어 자체 kSecureVersion 을
+  // target 값으로 임시 사용하여 (= 동일 값이므로 strictly greater 검사 실패)
+  // 명시적 차단 경로 자체는 만들지 않고 안전 측 로깅만. 다음 라운드 server
+  // 합의 후 OtaCommand 에 secureVersion 필드 추가 + 본 가드 활성화.
+  //
+  // 본 호출은 현재 항상 통과 — 펌웨어 자체 secure_version 과 비교 시 false
+  // 가 되지만, 서버 매니페스트가 secure_version 을 명시 안 한 상황에서
+  // 무조건 차단하면 모든 OTA 가 막혀버리므로 hook 만 정의해 두고 실제 분기는
+  // ota.secureVersion 필드 추가 라운드에서 활성화.
 
   if (batteryPercent < iconia::config::kBatteryOtaMinPercent) {
     logLine(String("[OTA-GUARD] battery ") + batteryPercent + "% < " +
@@ -1855,6 +1898,18 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
   logLine(String("[OTA] start version=") + ota.version +
           " size=" + String((long)ota.sizeBytes) +
           " url=" + sanitizeUrlForLog(ota.url));
+
+  // Stage telemetry: manifest_received (canEnterOta 통과 + 진입 직전).
+  // attemptNo 는 본 라운드 단순화 — 동일 wake 의 단일 시도이므로 1.
+  // 추후 RTC slow-mem 카운터로 deployment 단위 누적 시도 추적 가능.
+  // target_secure_version 은 서버 매니페스트 미합의 — 임시로 펌웨어 자체의
+  // kSecureVersion 사용 (실제로는 서버가 X-OTA-Secure-Version 헤더로 전달
+  // 해야 하나 현 라운드는 펌웨어 측 hook 만 정의).
+  iconia::ota::onManifestReceived(
+      ota.version.c_str(),
+      iconia::config::kSecureVersion,
+      ota.sizeBytes > 0 ? (uint32_t)ota.sizeBytes : 0u,
+      /*attemptNo=*/1);
 
   // Anti-rollback 사전 체크: lockdown 빌드는 펌웨어 헤더의 secure_version
   // 이 eFuse SECURE_VERSION 보다 작으면 OTA finish 가 자동 거부된다 (ESP-IDF
@@ -1929,12 +1984,30 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
   }
 
   // 스트리밍 다운로드. perform()은 청크 단위로 IN_PROGRESS를 반환.
+  // Downloading 단계 telemetry 는 청크당 emit 하면 큐가 빠르게 가득 차므로,
+  // 1초 간격 sampling. RTC slow-mem 큐 capacity = 5 — Downloading 은 보통
+  // 1~2개만 보존되어 다른 단계 (manifest/applying/health) 를 밀어내지 않도록
+  // 보장.
+  unsigned long lastTelemetryMs = 0;
   while (true) {
     err = esp_https_ota_perform(handle);
     if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
       break;
     }
     esp_task_wdt_reset();
+
+    unsigned long now = millis();
+    if (now - lastTelemetryMs >= 1000UL) {
+      lastTelemetryMs = now;
+      int doneBytes = esp_https_ota_get_image_len_read(handle);
+      int totalBytes = esp_https_ota_get_image_size(handle);
+      iconia::ota::onDownloading(
+          doneBytes > 0 ? (uint32_t)doneBytes : 0u,
+          totalBytes > 0 ? (uint32_t)totalBytes : 0u,
+          /*attemptNo=*/1,
+          (int16_t)WiFi.RSSI(),
+          /*batteryMv=*/0u);  // 측정값 미지정 — 호출 비용 최소화
+    }
   }
 
   if (err != ESP_OK) {
@@ -1997,13 +2070,18 @@ bool IconiaApp::performOta(const OtaCommand& ota) {
   if (ota.sha256 != String(hexDigest)) {
     logLine(String("[OTA] sha256 mismatch expected=") + ota.sha256 +
             " got=" + String(hexDigest));
+    iconia::ota::onDownloadComplete(/*shaMatch=*/false, /*attemptNo=*/1);
     esp_https_ota_abort(handle);
     recordOtaResult(iconia::protocol::kOtaResultShaMismatch, ota.version.c_str());
     esp_task_wdt_reconfigure(&wdtDefault);
     return false;
   }
   logLine("[OTA] sha256 verified");
+  iconia::ota::onDownloadComplete(/*shaMatch=*/true, /*attemptNo=*/1);
 
+  // Stage telemetry: applying — partition swap 직전 (esp_https_ota_finish 가
+  // 새 partition 을 boot partition 으로 마크).
+  iconia::ota::onApplying(/*attemptNo=*/1);
   err = esp_https_ota_finish(handle);
   // Watchdog 즉시 복귀(restart 전이어도 안전 측에서).
   esp_task_wdt_reconfigure(&wdtDefault);
@@ -2245,4 +2323,10 @@ void IconiaApp::detectRollbackOnBoot() {
     return;
   }
   recordOtaResult(iconia::protocol::kOtaResultRolledBack, prevVersion.c_str());
+
+  // Stage 7 telemetry: rolled_back. 이전 partition 으로 복귀 후 첫 부팅에
+  // 도달한 시점이므로, 본 record 는 NVS 의 attempt_ver (= 죽은 버전) 와 함께
+  // RTC slow-mem 큐에 적재. 실제 HTTPS POST /ota-status 는 server endpoint
+  // 합의 후 다음 라운드에서 큐 flush 함수로 일괄 전송.
+  iconia::ota::onRolledBack(prevVersion.c_str());
 }
