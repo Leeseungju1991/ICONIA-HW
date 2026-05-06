@@ -28,6 +28,7 @@
 #include "iconia_config.h"
 #include "iconia_protocol.h"
 #include "iconia_security.h"
+#include "iconia_boot_check.h"
 
 IconiaApp* gAppInstance = nullptr;
 
@@ -214,6 +215,24 @@ void IconiaApp::begin() {
   // 동일 가드에 firmware_version placeholder("0.0.0-placeholder")도 함께 걸린다
   // (placeholderSecretsPresent() 내부 검사).
   haltOnPlaceholderSecrets();
+
+  // -------------------------------------------------------------------------
+  // PROD 빌드 boot self-check (정본: docs/operational_telemetry.md §4)
+  // -------------------------------------------------------------------------
+  // lockdown 빌드는 SecureBoot / FlashEncryption RELEASE / JTAG-disable / UART
+  // download disable / factory seed / secure_version 모두 통과해야 부팅 진행.
+  // 하나라도 실패하면 panic_log NVS 기록 후 EXT1 wakeup disable + 영구 deep sleep.
+  // dev 빌드는 즉시 통과 (디버깅 가능 유지).
+  {
+    iconia::boot_check::Result br = iconia::boot_check::runAll();
+    if (!br.pass) {
+      logLine(String("[FATAL] boot invariants violated mask=0x") +
+              String(br.violationMask, HEX) +
+              " first=0x" + String(br.firstViolationBit, HEX));
+      iconia::boot_check::recordPanicLog(br.violationMask);
+      iconia::boot_check::haltForever();  // [[noreturn]]
+    }
+  }
 
   // anti-rollback: ESP-IDF 가 부트로더 단계에서 eFuse SECURE_VERSION 과
   // 펌웨어 헤더의 secure_version 을 자동 비교하므로, 이 시점에 부팅 성공

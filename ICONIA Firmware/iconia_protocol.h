@@ -87,20 +87,56 @@ static constexpr size_t kProvReservedLen = 8;
 // append 공격 차단. 펌웨어는 누적 길이 > kProvMaxBlobLen 이면 즉시 abort.
 static constexpr size_t kProvMaxBlobLen = 512;
 
-// Status notify payload 형식: "0xNN:label". 코드는 §8 와 일치해야 한다.
-static constexpr const char* kProvStatusSuccess     = "0x00:success";
-static constexpr const char* kProvStatusNotBonded   = "0x01:not_bonded";
-static constexpr const char* kProvStatusBadMagic    = "0x02:bad_magic";
-static constexpr const char* kProvStatusBadSeq      = "0x03:bad_seq";
-static constexpr const char* kProvStatusChunkTo     = "0x04:chunk_timeout";
-static constexpr const char* kProvStatusTsWindow    = "0x05:ts_window";
-static constexpr const char* kProvStatusReplay      = "0x06:replay";
-static constexpr const char* kProvStatusAeadFail    = "0x07:aead_fail";
-static constexpr const char* kProvStatusBadPlain    = "0x08:bad_plaintext";
-static constexpr const char* kProvStatusWifiAuth    = "0x09:wifi_auth_fail";
-static constexpr const char* kProvStatusWifiNoAp    = "0x0A:wifi_no_ap";
-static constexpr const char* kProvStatusLockedOut   = "0xFE:locked_out";
-static constexpr const char* kProvStatusTimeout     = "0xFF:timeout";
+// Status notify payload 형식: "0xNN:label". 코드는 docs/security_handshake.md §8
+// 표와 1:1 정합. 추가/변경 시 §8 + docs/operational_telemetry.md §1 동시 갱신.
+//
+// 코드 영역 분류 (number space 충돌 방지)
+//   0x00         success
+//   0x01..0x0A   기존 검증 실패 (보안 핸드셰이크 단계 — 본 라운드 변경 없음)
+//   0x10..0x1F   진행률 정보 코드 (본 라운드 신설; 정상 흐름 ACK)
+//   0x20..0x2F   Wi-Fi 단계 실패 세분화 (본 라운드 신설)
+//   0xFB         session_expired (본 라운드 신설; 60s credential 미수신)
+//   0xFE         locked_out (12h hard cap)
+//   0xFF         timeout (2 분 광고 윈도우)
+//
+// 본 라운드 신설 코드의 recoverable / retry-after / 사용자 카피 매핑은
+// docs/security_handshake.md §8 표 참조.
+static constexpr const char* kProvStatusSuccess        = "0x00:success";
+static constexpr const char* kProvStatusNotBonded      = "0x01:not_bonded";
+static constexpr const char* kProvStatusBadMagic       = "0x02:bad_magic";
+static constexpr const char* kProvStatusBadSeq         = "0x03:bad_seq";
+static constexpr const char* kProvStatusChunkTo        = "0x04:chunk_timeout";
+static constexpr const char* kProvStatusTsWindow       = "0x05:ts_window";
+static constexpr const char* kProvStatusReplay         = "0x06:replay";
+static constexpr const char* kProvStatusAeadFail       = "0x07:aead_fail";
+static constexpr const char* kProvStatusBadPlain       = "0x08:bad_plaintext";
+static constexpr const char* kProvStatusWifiAuth       = "0x09:wifi_auth_fail";
+static constexpr const char* kProvStatusWifiNoAp       = "0x0A:wifi_no_ap";
+
+// 진행률 정보 코드 (본 라운드 신설; iconia_session.cpp::infoTokenForStage 와 1:1).
+static constexpr const char* kProvInfoAdvertising      = "0x10:advertising";
+static constexpr const char* kProvInfoConnecting       = "0x11:connecting";
+static constexpr const char* kProvInfoBonding          = "0x12:bonding";
+static constexpr const char* kProvInfoBonded           = "0x13:bonded";
+static constexpr const char* kProvInfoCapabilityRead   = "0x14:capability_read";
+static constexpr const char* kProvInfoSessionRead      = "0x15:session_read";
+static constexpr const char* kProvInfoCredentialRecv   = "0x16:credential_recv";
+static constexpr const char* kProvInfoWifiVerify       = "0x17:wifi_verify";
+
+// Wi-Fi 단계 실패 세분화 (본 라운드 신설) — recoverable / retry-after 메타는
+// docs/security_handshake.md §8 표. 기존 0x09/0x0A 와 의미가 부분 중복이지만,
+// 본 신설 코드는 "사용자 친화 메시지 + retry-after hint" 동봉 가능한 신규 영역.
+// 펌웨어/모바일 합의 후 0x09/0x0A 점진 deprecate.
+static constexpr const char* kProvStatusBadQrFormat    = "0x20:bad_qr_format";
+static constexpr const char* kProvStatusPinMismatch    = "0x21:pin_mismatch";
+static constexpr const char* kProvStatusSsidNotFound   = "0x22:ssid_not_found";
+static constexpr const char* kProvStatusWifiAuthFail   = "0x23:wifi_auth_fail";
+static constexpr const char* kProvStatusWifiTimeout    = "0x24:wifi_timeout";
+static constexpr const char* kProvStatusWifiNoInternet = "0x25:wifi_no_internet";
+
+static constexpr const char* kProvStatusSessionExpired = "0xFB:session_expired";
+static constexpr const char* kProvStatusLockedOut      = "0xFE:locked_out";
+static constexpr const char* kProvStatusTimeout        = "0xFF:timeout";
 
 }  // namespace protocol
 }  // namespace iconia

@@ -1,4 +1,4 @@
-# ICONIA dual-OTA + factory-seed partition table for ESP32-CAM 4MB flash.
+# ICONIA dual-OTA + factory-seed + events-queue partition table for ESP32-CAM 4MB flash.
 #
 # WHY: 기본 "Huge APP" (3MB single app)은 OTA 미지원. OTA 도입을 위해
 # app0 / app1 듀얼 슬롯 + otadata + nvs로 재배치한다. 카메라 framebuffer는
@@ -9,18 +9,28 @@
 # 읽기만 수행 (mode=true 로 `Preferences.begin("factory", true)`). 양산
 # 라인 burn 절차는 docs/production_provisioning.md §3 Step 6 참조.
 #
+# 추가(라운드 신뢰성/회복성): events_q (SPIFFS) 파티션 — 업로드 실패한
+# 이벤트(JPEG + 메타) 영속 큐. 다음 부팅 시 우선 flush. 정본:
+# docs/operational_telemetry.md §2 + iconia_upload_queue.{h,cpp}.
+#   - 슬롯당 평균 ~120 KB (VGA q12 JPEG + 32B 메타) → 단일 partition 0xB0000
+#     704 KB 안에 5~6 슬롯 ring buffer. 가득 차면 가장 오래된 entry drop +
+#     telemetry counter 인상.
+#   - SPIFFS subtype 사용 (LittleFS 도 호환 가능하지만 Arduino-ESP32 core 가
+#     SPIFFS 를 기본 지원 → 별도 의존성 없이 즉시 동작).
+#
 # Arduino IDE 적용:
 #   Tools > Partition Scheme > "Custom" 선택 후 이 파일을 sketch 폴더에 두면
 #   Arduino-ESP32 core 3.x가 자동으로 partitions.csv를 인식한다.
 #   (또는 boards.txt의 esp32cam.menu.PartitionScheme.custom 항목을 활성화)
 #
 # 레이아웃 (총 4MB = 0x400000):
-#   0x009000  nvs          0x004000  (16KB)  Wi-Fi 자격증명, OTA 시도 카운트
+#   0x009000  nvs          0x004000  (16KB)  Wi-Fi 자격증명, OTA 시도 카운트, panic_log
 #   0x00D000  factory_nvs  0x001000  ( 4KB)  factory seed/salt/pid (RO at runtime)
 #   0x00E000  otadata      0x002000  ( 8KB)  현재 부팅 슬롯 + pending_verify 상태
 #   0x010000  app0         0x180000  (1.5MB) factory + 첫 OTA 슬롯
 #   0x190000  app1         0x180000  (1.5MB) 두 번째 OTA 슬롯
-#   0x310000  spiffs       0x0F0000  (~960KB) 향후 펌웨어 임시 파일/로그 (현재 미사용)
+#   0x310000  spiffs       0x040000  ( 256KB) 임시 파일 / 향후 로그 (보존 영역)
+#   0x350000  events_q     0x0B0000  ( 704KB) 업로드 실패 이벤트 ring buffer (SPIFFS)
 #
 # Name,        Type, SubType, Offset,   Size,    Flags
 nvs,           data, nvs,     0x9000,   0x4000,
@@ -28,4 +38,5 @@ factory_nvs,   data, nvs,     0xd000,   0x1000,
 otadata,       data, ota,     0xe000,   0x2000,
 app0,          app,  ota_0,   0x10000,  0x180000,
 app1,          app,  ota_1,   0x190000, 0x180000,
-spiffs,        data, spiffs,  0x310000, 0xF0000,
+spiffs,        data, spiffs,  0x310000, 0x40000,
+events_q,      data, spiffs,  0x350000, 0xB0000,

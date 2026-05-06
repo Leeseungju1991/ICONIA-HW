@@ -264,21 +264,69 @@ unregister 후 deep sleep.
 "0x{code_hex}:{label}"
 ```
 
-| code | label | 설명 |
-|------|-------|------|
-| 0x00 | success | 자격증명 검증 + Wi-Fi 연결 성공 |
-| 0x01 | not_bonded | 본딩 안 된 클라이언트 write |
-| 0x02 | bad_magic | magic/version 불일치 |
-| 0x03 | bad_seq | seq 단조성 위반/길이 초과 |
-| 0x04 | chunk_timeout | last_chunk 30s 내 미수신 |
-| 0x05 | ts_window | timestamp 윈도우 ±10 분 초과 |
-| 0x06 | replay | nonce/ts 페어가 cache 에 존재 |
-| 0x07 | aead_fail | AES-GCM 인증 실패 |
-| 0x08 | bad_plaintext | ssid/psk 길이 위반 |
-| 0x09 | wifi_auth_fail | Wi-Fi 비밀번호 불일치 |
-| 0x0A | wifi_no_ap | Wi-Fi AP 발견 실패 |
-| 0xFE | locked_out | 12h hard cap 도달, 라디오 강제 종료 |
-| 0xFF | timeout | 2분 광고 윈도우 만료 |
+코드 영역 분류:
+- `0x00` — success
+- `0x01..0x0A` — 핸드셰이크 단계 검증 실패 (보안)
+- `0x10..0x1F` — 진행률 정보 코드 (정상 흐름 ACK; v1.2 신설)
+- `0x20..0x2F` — Wi-Fi 단계 실패 세분화 (v1.2 신설)
+- `0xFB` — session_expired (v1.2 신설)
+- `0xFE` — locked_out
+- `0xFF` — timeout
+
+`severity` 컬럼: `fatal` (RMA 또는 사용자 인지 필수) / `recoverable` (사용자
+재시도로 회복 가능) / `transient` (자동 재시도 권장) / `info` (정상 진행).
+`retry_after_sec` 컬럼: 다음 시도까지 권장 지연 (앱이 사용자에게 보여주는 hint).
+
+| code | label | severity | retry_after_sec | 사용자 카피 (앱 노출 권장) | 설명 |
+|------|-------|----------|------|------------------------------|------|
+| 0x00 | success | info | - | "연결 완료!" | 자격증명 검증 + Wi-Fi 연결 성공 |
+| 0x01 | not_bonded | recoverable | 0 | "다시 페어링을 시도해주세요." | 본딩 안 된 클라이언트 write |
+| 0x02 | bad_magic | fatal | - | "앱을 최신 버전으로 업데이트해주세요." | magic/version 불일치 (앱-펌웨어 버전 mismatch) |
+| 0x03 | bad_seq | recoverable | 2 | "잠시 후 다시 시도해주세요." | seq 단조성 위반/누적 길이 초과 |
+| 0x04 | chunk_timeout | recoverable | 5 | "Wi-Fi 정보 입력을 더 빠르게 완료해주세요." | last_chunk 30s 내 미수신 |
+| 0x05 | ts_window | recoverable | 0 | "휴대폰 시간이 정확한지 확인해주세요." | timestamp 윈도우 ±10 분 초과 |
+| 0x06 | replay | fatal | - | "잠시 후 다시 페어링해주세요." | nonce/ts 페어가 cache 에 존재 |
+| 0x07 | aead_fail | fatal | - | "고객지원에 문의해주세요." | AES-GCM 인증 실패 (factory seed mismatch) |
+| 0x08 | bad_plaintext | recoverable | 0 | "Wi-Fi 비밀번호 형식을 확인해주세요." | ssid/psk 길이 위반 |
+| 0x09 | wifi_auth_fail | recoverable | 0 | "Wi-Fi 비밀번호가 맞지 않습니다." | Wi-Fi 비밀번호 불일치 (deprecated; 0x23 권장) |
+| 0x0A | wifi_no_ap | recoverable | 5 | "Wi-Fi 신호를 찾을 수 없습니다." | Wi-Fi AP 발견 실패 (deprecated; 0x22 권장) |
+| 0x10 | advertising | info | - | "기기를 찾는 중…" | BLE 광고 시작 |
+| 0x11 | connecting | info | - | "기기에 연결 중…" | GAP connect 수신 |
+| 0x12 | bonding | info | - | "보안 키 교환 중…" | LTK 교환 진행 |
+| 0x13 | bonded | info | - | "안전 연결 완료!" | LTK 검증 완료 |
+| 0x14 | capability_read | info | - | "기기 정보 확인 중…" | Capability char read 완료 |
+| 0x15 | session_read | info | - | "세션 키 생성 중…" | Session char read 완료 |
+| 0x16 | credential_recv | info | - | "Wi-Fi 정보 수신 중…" | Credential write 누적 |
+| 0x17 | wifi_verify | info | - | "Wi-Fi 연결 확인 중…" | 디코드된 자격증명으로 연결 시도 |
+| 0x20 | bad_qr_format | recoverable | 0 | "QR 코드를 다시 스캔해주세요." | OOB seed 채널의 QR 형식 오류 |
+| 0x21 | pin_mismatch | recoverable | 0 | "비밀번호가 일치하지 않습니다." | 6자리 PIN 또는 OOB pairing 코드 불일치 |
+| 0x22 | ssid_not_found | recoverable | 5 | "Wi-Fi 이름이 보이지 않습니다." | 입력된 SSID 가 주변에 없음 |
+| 0x23 | wifi_auth_fail | recoverable | 0 | "Wi-Fi 비밀번호가 맞지 않습니다." | Wi-Fi 비밀번호 불일치 (정본; 0x09 대체) |
+| 0x24 | wifi_timeout | transient | 10 | "Wi-Fi 연결이 너무 느려요." | 라우터 응답 지연/링크 약함 |
+| 0x25 | wifi_no_internet | recoverable | 30 | "Wi-Fi 는 됐지만 인터넷이 안 돼요." | DNS/외부 도달 실패 |
+| 0xFB | session_expired | recoverable | 0 | "시간이 너무 오래 걸렸어요. 다시 시도해주세요." | 60s credential 미수신 (사용자 입력 지연) |
+| 0xFE | locked_out | fatal | 43200 | "여러 번 실패해서 12시간 잠겼어요." | 12h hard cap 도달 |
+| 0xFF | timeout | recoverable | 0 | "페어링 시간이 끝났어요. 다시 시도해주세요." | 2 분 광고 윈도우 만료 |
+
+### 8.1 ACK 의미 정교화
+
+본 v1.2 부터 모든 단계 진입 시 펌웨어가 진행률 정보 코드(0x10..0x17)를
+Status notify 로 발송한다. RN 앱은 다음 흐름으로 사용자 UX 갱신:
+
+```
+0x10 advertising      → 검색 중 spinner
+0x11 connecting       → 연결 중 spinner
+0x12 bonding          → "보안 키 교환 중" 텍스트
+0x13 bonded           → checkmark + 다음 단계 진행
+0x14 capability_read  → 진행률 25%
+0x15 session_read     → 진행률 50%
+0x16 credential_recv  → 진행률 75% (사용자 SSID/PSK 입력 완료 후)
+0x17 wifi_verify      → 진행률 90% (Wi-Fi 연결 검증 중)
+0x00 success          → 진행률 100% + 페어링 완료 화면
+```
+
+ACK 가 누락되면(예: BLE link 끊김으로 notify 손실) 앱은 30s 후 connection
+상태 polling 으로 fallback. 이 동작은 앱 측 정합 — `rn-mobile` 합의 필요.
 
 ---
 
@@ -349,6 +397,11 @@ hmac_hex = HMAC-SHA256(factory_seed, message)   // hex, lower-case 64 chars
 
 ## 13. 변경 이력
 
+- v1.2 (2026-05-06): §8 표 정교화 — 진행률 정보 코드(0x10..0x17), Wi-Fi 단계
+  실패 세분화(0x20..0x25), session_expired(0xFB) 신설. severity / retry-after
+  / 사용자 카피 컬럼 추가. §8.1 ACK 의미 정교화 절 추가. 기존 0x09/0x0A 는
+  당분간 alias 로 유지하되 deprecate 표시 — 앱은 신 코드로 마이그레이션.
+  관련 운영성 정본은 별도 문서 `operational_telemetry.md` 로 분리.
 - v1.1 (2026-05-06): §12 서버 등록 클레임 흡수 (기존 단방향 BLE 정본 → BLE+서버
   통합 정본). §2.2 에 deprecated 평문 char e1/e2 명시 보강.
 - v1   (2026-05-06): 초안. legacy 평문 GATT deprecate.
